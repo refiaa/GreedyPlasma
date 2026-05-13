@@ -1,0 +1,3 @@
+[submodule "GreenPlasma"]
+	path = GreenPlasma
+	url = https://github.com/Nightmare-Eclipse/GreenPlasma.git
