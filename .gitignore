@@ -1,0 +1,21 @@
+# Build output
+build/
+artifacts/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.vcxproj.user
+
+# Logs and temporary files
+*.log
+*.tmp
+*.dmp
