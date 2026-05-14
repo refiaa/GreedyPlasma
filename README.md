@@ -1,6 +1,6 @@
 # GreedyPlasma
 
-*WIP*
+**WIP**
 
 Script based on [`GreenPlasma`](https://github.com/Nightmare-Eclipse/GreenPlasma).
 

