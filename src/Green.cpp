@@ -1,6 +1,10 @@
 
+// Working in Progress
+
+#define WIN32_NO_STATUS
 #include <Windows.h>
 #include <winternl.h>
+#undef WIN32_NO_STATUS
 #include <aclapi.h>
 #include <ntstatus.h>
 #include <sddl.h>
