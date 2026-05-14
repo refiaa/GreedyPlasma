@@ -29,6 +29,10 @@
 #define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
 #endif
 
+#ifndef STATUS_TIMEOUT
+#define STATUS_TIMEOUT ((NTSTATUS)0x00000102L)
+#endif
+
 #ifndef SECTION_QUERY
 #define SECTION_QUERY 0x0001
 #endif
@@ -39,6 +43,14 @@
 
 #ifndef SECTION_MAP_READ
 #define SECTION_MAP_READ 0x0004
+#endif
+
+#ifndef LPC_CONNECTION_REQUEST
+#define LPC_CONNECTION_REQUEST 2
+#endif
+
+#ifndef ALPC_PORT_ALLOW_IMPERSONATION
+#define ALPC_PORT_ALLOW_IMPERSONATION 0x20000
 #endif
 
 #ifndef GP_OPEN_TIMEOUT_MS
@@ -1191,18 +1203,6 @@ static GpBlockedSinkResult DllLoad(const GpRunEvidence& evidence, const wchar_t*
     }
     return MakeBlockedSinkResult(PrimitivePrecondition(evidence));
 }
-
-#ifndef STATUS_TIMEOUT
-#define STATUS_TIMEOUT ((NTSTATUS)0x00000102L)
-#endif
-
-#ifndef LPC_CONNECTION_REQUEST
-#define LPC_CONNECTION_REQUEST 2
-#endif
-
-#ifndef ALPC_PORT_ALLOW_IMPERSONATION
-#define ALPC_PORT_ALLOW_IMPERSONATION 0x20000
-#endif
 
 static GpBlockedSinkResult AlpcTokenCapture(const GpRunEvidence& evidence, const wchar_t* requestedPortName)
 {
