@@ -1,6 +1,6 @@
 # GreedyPlasma
 
-**WIP**
+still working on it.
 
 Script based on [`GreenPlasma`](https://github.com/Nightmare-Eclipse/GreenPlasma).
 
@@ -58,3 +58,7 @@ Compared with the base PoC direction, this version currently adds or changes:
 ## Development status
 
 The code is still WIP. The current intent is to make the flow easier to inspect statically and easier to reason about when run in a controlled research environment, while keeping failure states explicit rather than silently assuming success.
+
+> [!CAUTION]
+> LEGAL AND TECHNICAL DISCLAIMER
+> The author assumes no liability for any damages, system instability, or legal consequences arising from the use of this software. 
