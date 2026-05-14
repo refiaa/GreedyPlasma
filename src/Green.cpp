@@ -219,6 +219,12 @@ enum class GpStatus {
 struct GpRegistryEvidence {
     bool attempted;
     bool succeeded;
+    bool policiesRootKeyCreated;
+    bool policiesMicrosoftKeyCreated;
+    bool cloudFilesKeyCreated;
+    bool currentVersionPoliciesKeyCreated;
+    bool policiesSystemKeyCreated;
+    bool blockedAppsLinkCreated;
     bool cloudFilesDaclSet;
     bool linkValueSet;
     bool policiesDaclSet;
@@ -729,11 +735,130 @@ static bool OpenSectionWithTimeout(
     }
 }
 
-static void DeleteRegistryLinkKey(HKEY hk)
+static NTSTATUS DeleteRegistryLinkKey(HKEY hk)
 {
     if (hk && _NtDeleteKey) {
-        _NtDeleteKey(hk);
+        return _NtDeleteKey(hk);
     }
+    return STATUS_UNSUCCESSFUL;
+}
+
+static DWORD EnsureRegistryKeyExists(HKEY root, const wchar_t* subKey, bool* created)
+{
+    HKEY key = NULL;
+    DWORD disposition = 0;
+
+    if (created) {
+        *created = false;
+    }
+
+    if (!root || !subKey || !subKey[0]) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    DWORD res = RegCreateKeyExW(
+        root,
+        subKey,
+        0,
+        NULL,
+        REG_OPTION_NON_VOLATILE,
+        KEY_READ | KEY_WRITE,
+        NULL,
+        &key,
+        &disposition);
+
+    if (key) {
+        RegCloseKey(key);
+    }
+
+    if (res == ERROR_SUCCESS && created) {
+        *created = (disposition == REG_CREATED_NEW_KEY);
+    }
+
+    return res;
+}
+
+static void DeleteCreatedRegistryKey(const wchar_t* subKey, bool created)
+{
+    if (!created || !subKey || !subKey[0]) {
+        return;
+    }
+
+    DWORD res = RegDeleteKeyW(HKEY_CURRENT_USER, subKey);
+    if (res != ERROR_SUCCESS && res != ERROR_FILE_NOT_FOUND) {
+        TraceWin32(L"CLEANUP", L"reg-delete", res);
+    }
+}
+
+static void DeleteCreatedRegistryLinkKey(const wchar_t* subKey, bool created)
+{
+    if (!created || !subKey || !subKey[0]) {
+        return;
+    }
+
+    HKEY hk = NULL;
+    DWORD res = RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        subKey,
+        REG_OPTION_OPEN_LINK,
+        DELETE,
+        &hk);
+    if (res == ERROR_FILE_NOT_FOUND) {
+        return;
+    }
+    if (res != ERROR_SUCCESS) {
+        TraceWin32(L"CLEANUP", L"reg-link-open", res);
+        return;
+    }
+
+    NTSTATUS status = DeleteRegistryLinkKey(hk);
+    if (!NT_SUCCESS(status)) {
+        TraceNtStatus(L"CLEANUP", L"reg-link-delete", status);
+    }
+    RegCloseKey(hk);
+}
+
+static void CleanupRegistryEvidence(const GpRegistryEvidence* registry)
+{
+    if (!registry || !registry->attempted) {
+        return;
+    }
+
+    if (registry->disableLockSet) {
+        HKEY hk = NULL;
+        DWORD res = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+            0,
+            KEY_SET_VALUE,
+            &hk);
+        if (res == ERROR_SUCCESS) {
+            RegDeleteValueW(hk, L"DisableLockWorkstation");
+            RegCloseKey(hk);
+        }
+        else if (res != ERROR_FILE_NOT_FOUND) {
+            TraceWin32(L"CLEANUP", L"policy-open", res);
+        }
+    }
+
+    DeleteCreatedRegistryLinkKey(
+        L"Software\\Policies\\Microsoft\\CloudFiles\\BlockedApps",
+        registry->blockedAppsLinkCreated);
+    DeleteCreatedRegistryKey(
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        registry->policiesSystemKeyCreated);
+    DeleteCreatedRegistryKey(
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies",
+        registry->currentVersionPoliciesKeyCreated);
+    DeleteCreatedRegistryKey(
+        L"Software\\Policies\\Microsoft\\CloudFiles",
+        registry->cloudFilesKeyCreated);
+    DeleteCreatedRegistryKey(
+        L"Software\\Policies\\Microsoft",
+        registry->policiesMicrosoftKeyCreated);
+    DeleteCreatedRegistryKey(
+        L"Software\\Policies",
+        registry->policiesRootKeyCreated);
 }
 
 static bool SetPolicyVal(GpRegistryEvidence* registry)
@@ -752,6 +877,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
     wchar_t linktarget[MAX_PATH] = { 0 };
     PTOKEN_USER pTokenUser = NULL;
     bool linkKeyOpen = false;
+    DWORD linkKeyDisposition = 0;
 
     if (registry) {
         ZeroMemory(registry, sizeof(*registry));
@@ -772,6 +898,56 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
     if (ERROR_SUCCESS != dwRes) {
         failure = dwRes;
         TraceWin32(L"P4", L"acl", dwRes);
+        goto cleanup;
+    }
+
+    res = EnsureRegistryKeyExists(
+        HKEY_CURRENT_USER,
+        L"Software\\Policies",
+        registry ? &registry->policiesRootKeyCreated : NULL);
+    if (res) {
+        failure = res;
+        TraceWin32(L"P4", L"reg-create", res);
+        goto cleanup;
+    }
+
+    res = EnsureRegistryKeyExists(
+        HKEY_CURRENT_USER,
+        L"Software\\Policies\\Microsoft",
+        registry ? &registry->policiesMicrosoftKeyCreated : NULL);
+    if (res) {
+        failure = res;
+        TraceWin32(L"P4", L"reg-create", res);
+        goto cleanup;
+    }
+
+    res = EnsureRegistryKeyExists(
+        HKEY_CURRENT_USER,
+        L"Software\\Policies\\Microsoft\\CloudFiles",
+        registry ? &registry->cloudFilesKeyCreated : NULL);
+    if (res) {
+        failure = res;
+        TraceWin32(L"P4", L"reg-create", res);
+        goto cleanup;
+    }
+
+    res = EnsureRegistryKeyExists(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies",
+        registry ? &registry->currentVersionPoliciesKeyCreated : NULL);
+    if (res) {
+        failure = res;
+        TraceWin32(L"P4", L"reg-create", res);
+        goto cleanup;
+    }
+
+    res = EnsureRegistryKeyExists(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        registry ? &registry->policiesSystemKeyCreated : NULL);
+    if (res) {
+        failure = res;
+        TraceWin32(L"P4", L"reg-create", res);
         goto cleanup;
     }
 
@@ -812,13 +988,16 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
         KEY_ALL_ACCESS,
         NULL,
         &hk,
-        NULL);
+        &linkKeyDisposition);
     if (res) {
         failure = res;
         TraceWin32(L"P4", L"reg", res);
         goto cleanup;
     }
     linkKeyOpen = true;
+    if (registry) {
+        registry->blockedAppsLinkCreated = (linkKeyDisposition == REG_CREATED_NEW_KEY);
+    }
 
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &htoken)) {
         failure = GetLastError();
@@ -1932,19 +2111,7 @@ cleanup:
         run.sectionHandle = NULL;
     }
 
-    if (run.registry.succeeded) {
-        HKEY hk = NULL;
-        DWORD res = RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-            0,
-            KEY_SET_VALUE,
-            &hk);
-        if (res == ERROR_SUCCESS) {
-            RegDeleteValueW(hk, L"DisableLockWorkstation");
-            RegCloseKey(hk);
-        }
-    }
+    CleanupRegistryEvidence(&run.registry);
 
     wprintf(L"done=%ls\n", exitCode == 0 ? L"ok" : L"partial");
     return exitCode;
