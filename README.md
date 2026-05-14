@@ -1,5 +1,7 @@
 # GreedyPlasma
 
+still working on it.
+
 Script based on [`GreenPlasma`](https://github.com/Nightmare-Eclipse/GreenPlasma).
 
 `green.cpp` retains the original vulnerability primitive while attempting to make the flow more observable and less dependent on hard stops. The code should be read as an experimental PoC-oriented harness, not as a guaranteed end-to-end exploit chain.
