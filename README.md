@@ -1,5 +1,7 @@
 # GreedyPlasma
 
+*WIP*
+
 Script based on [`GreenPlasma`](https://github.com/Nightmare-Eclipse/GreenPlasma).
 
 `green.cpp` retains the original vulnerability primitive while attempting to implement the following modifications:
