@@ -58,7 +58,7 @@ with access like:
 query=1 read=1 write=0 dac=0 owner=0
 ```
 
-and security descriptors granting read/query-style access but not `SECTION_MAP_WRITE`. In that state, `NtMapViewOfSection` can only produce a read-only mapping, so the `GP_CACHE_LAYOUT_HYPOTHESIS` ALPC mutation path remains In that state, `NtMapViewOfSection` can only produce a read-only mapping, so the `GP_CACHE_LAYOUT_HYPOTHESIS` ALPC mutation path remains an unproven experiment rather than part of the proven primitive.
+and security descriptors granting read/query-style access but not `SECTION_MAP_WRITE`. In that state, `NtMapViewOfSection` can only produce a read-only mapping, so the `GP_CACHE_LAYOUT_HYPOTHESIS` ALPC mutation path remains an unproven experiment rather than part of the proven primitive.
 
 The ALPC, token, shell, DLL, and direct code paths are kept as explicit status-oriented boundaries. 
 
