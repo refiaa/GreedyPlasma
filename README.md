@@ -1,5 +1,7 @@
 # GreedyPlasma
 
+<img width="1266" height="676" alt="img" src="https://github.com/user-attachments/assets/bf6b646b-b3ab-44f9-8fef-399f14af1bfb" />
+
 PoC harness for validating a Windows HKCU registry-follow primitive toward LPE.
 
 Inspired by the original [`GreenPlasma`](https://github.com/Nightmare-Eclipse/GreenPlasma) symbolic-link direction, but this harness currently explores a different registry-follow vector.
