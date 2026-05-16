@@ -19,3 +19,8 @@ artifacts/
 *.log
 *.tmp
 *.dmp
+
+/src/deprecated/
+/src/tools/
+include
+logs/
