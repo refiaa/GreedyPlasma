@@ -2,7 +2,7 @@
 
 PoC harness for validating a Windows HKCU registry-follow primitive toward LPE.
 
-Based on the original [`GreenPlasma`](https://github.com/Nightmare-Eclipse/GreenPlasma) direction.
+Inspired by the original [`GreenPlasma`](https://github.com/Nightmare-Eclipse/GreenPlasma) symbolic-link direction, but this harness currently explores a different registry-follow vector.
 
 ## Current Status
 
