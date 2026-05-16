@@ -24,7 +24,9 @@ Confirmed:
 - SYSTEM `svchost.exe` follows the staged source during the Paint lifecycle.
 - Redirected target receives:
 
-> Mixed = REG_QWORD 0
+```
+Mixed = REG_QWORD 0
+```
 
 Current claim:
 
@@ -45,11 +47,15 @@ Not yet proven:
 
 Source:
 
-> HKCU\Software\Microsoft\Windows NT\CurrentVersion\HostActivityManager\CommitHistory\Microsoft.Paint_8wekyb3d8bbwe!App
+```
+HKCU\Software\Microsoft\Windows NT\CurrentVersion\HostActivityManager\CommitHistory\Microsoft.Paint_8wekyb3d8bbwe!App
+```
 
 Default target:
 
-> HKCU\Software\Policies\Microsoft\Windows\CloudContent
+```
+HKCU\Software\Policies\Microsoft\Windows\CloudContent
+```
 
 > [!CAUTION]
 > **LEGAL AND TECHNICAL DISCLAIMER**
