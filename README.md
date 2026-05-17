@@ -13,7 +13,7 @@ Current default path: Paint HAM registry-follow primitive.
 Observed on:
 
 ```
-Windows 11 24H2
+Windows 11 Pro 24H2
 OS build 26100.2
 ```
 
