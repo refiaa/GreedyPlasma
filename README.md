@@ -51,17 +51,23 @@ Not yet proven:
 
 ## Default Source And Target
 
-Source:
-
+**Source 1 (Paint HAM):**
 ```
 HKCU\Software\Microsoft\Windows NT\CurrentVersion\HostActivityManager\CommitHistory\Microsoft.Paint_8wekyb3d8bbwe!App
-```
-
-Default target:
 
 ```
-HKCU\Software\Policies\Microsoft\Windows\CloudContent
+
+**Source 2 (StartMenuExperienceHost HAM LU):**
+
 ```
+HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\HAM\AUI\App\V1\LU
+
+```
+
+**Tested Targets:**
+
+* HKCU Target: `HKCU\Software\Policies\Microsoft\Windows\CloudContent`
+* HKLM Target: `HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\TermReason` (Partial mutation confirmed)
 
 > [!CAUTION]
 > **LEGAL AND TECHNICAL DISCLAIMER**
